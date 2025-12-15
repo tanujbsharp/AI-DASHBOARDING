@@ -32,8 +32,15 @@ CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
    ALWAYS add this filter unless user explicitly asks otherwise:
    {"term": {"user_status": 5}}     ← Active users only!
    
-   NOTE: Do NOT add assigned_status filter - the system handles this automatically
-   based on query intent (only for completion/assignment-related queries).
+   🔴 CRITICAL: For completion/assignment queries, you MUST also add:
+   {"term": {"assigned_status": 0}} ← Assigned records only!
+   
+   This applies to queries about:
+   - Completions (e.g., "how many modules has [user] completed", "total completions")
+   - Assignments (e.g., "assigned modules", "modules assigned to users")
+   - Module interactions (e.g., "modules completed", "modules in progress")
+   
+   See the response_type guidance below for specific examples.
 
 🔴 ID FIELDS FOR COUNTING (NEVER USE NAME FIELDS FOR CARDINALITY):
    ┌─────────────────────────────────────────────────────────────────────────┐
@@ -242,65 +249,88 @@ DATE FIELD RULES (Pick the Right Date Field for the Event)
     - USER SIGNUP → use user_created_on
     - HIRING/JOINING → use hired_on
     
-    🔴 CRITICAL: For "haven't completed" / "not completed" queries:
+    🔴🔴🔴 CRITICAL: For "haven't completed" / "not completed" / "didn't complete" queries:
        
-       TWO DIFFERENT PATTERNS:
+       TWO DIFFERENT PATTERNS - YOU MUST DETECT WHICH ONE:
        
-       1. "users who haven't completed any module in [time range]"
+       1. "users who haven't completed any module in [time range]" 
+          OR "who hasn't completed any module in [time range]"
+          OR "users who didn't complete any module in [time range]"
+          
+          → Pattern keywords: "haven't completed" + "in [time]" OR "didn't complete" + "in [time]"
           → This means: users with 0 completions (completed_status=1) in that time range
           → CRITICAL: This requires USER-LEVEL aggregation logic, NOT row-level filtering!
           → DO NOT filter by published_date - assigned modules from ANY time still count!
           → DO NOT use must_not or collapse - these are row-level filters that don't work correctly!
-          → MUST use aggregation-based approach:
-            {
+          → DO NOT just filter by user_status=5 - that's not enough!
+          → MUST use aggregation-based approach - THIS IS THE ONLY WAY IT WORKS:
+          
+          EXAMPLE QUERY STRUCTURE (copy this pattern exactly):
+            {{
               "size": 0,
-              "query": {
-                "bool": {
+              "query": {{
+                "bool": {{
                   "filter": [
-                    {"term": {"user_status": 5}}
+                    {{"term": {{"user_status": 5}}}},
+                    {{"term": {{"cmid": 1}}}}
                   ]
-                }
-              },
-              "aggs": {
-                "users": {
-                  "terms": {"field": "uid", "size": 50000},
-                  "aggs": {
-                    "assigned": {
-                      "filter": {
-                        "term": {"assigned_status": 0}
-                      }
-                    },
-                    "recent_completions": {
-                      "filter": {
-                        "bool": {
+                }}
+              }},
+              "aggs": {{
+                "users": {{
+                  "terms": {{"field": "uid", "size": 50000}},
+                  "aggs": {{
+                    "assigned": {{
+                      "filter": {{
+                        "term": {{"assigned_status": 0}}
+                      }}
+                    }},
+                    "recent_completions": {{
+                      "filter": {{
+                        "bool": {{
                           "must": [
-                            {"term": {"completed_status": 1}},
-                            {"range": {"completed_date": {time_range}}}
+                            {{"term": {{"completed_status": 1}}}},
+                            {{
+                              "range": {{
+                                "completed_date": {{
+                                  "gte": TIMESTAMP_START,
+                                  "lt": TIMESTAMP_END
+                                }}
+                              }}
+                            }}
                           ]
-                        }
-                      }
-                    },
-                    "only_inactive_users": {
-                      "bucket_selector": {
-                        "buckets_path": {
+                        }}
+                      }}
+                    }},
+                    "only_inactive_users": {{
+                      "bucket_selector": {{
+                        "buckets_path": {{
                           "assignedCount": "assigned._count",
                           "recentCompletedCount": "recent_completions._count"
-                        },
+                        }},
                         "script": "params.assignedCount > 0 && params.recentCompletedCount == 0"
-                      }
-                    },
-                    "user_info": {
-                      "top_hits": {
+                      }}
+                    }},
+                    "user_info": {{
+                      "top_hits": {{
                         "size": 1,
                         "_source": ["uid", "email_addr", "first_name", "last_name", "designation", "city", "country"]
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          → Logic: Group by uid, count assigned modules (ANY date), count recent completions (in time range),
-            filter users where assignedCount > 0 AND recentCompletedCount == 0
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          
+          → Logic: 
+            - Group by uid (user-level evaluation)
+            - Count assigned modules (assigned_status=0, ANY date - no published_date filter!)
+            - Count recent completions (completed_status=1 AND completed_date in time range)
+            - Filter users where: assignedCount > 0 AND recentCompletedCount == 0
+            - Use top_hits to get user details for display
+          
+          ⚠️ WARNING: If you generate a simple filter query like {{"term": {{"user_status": 5}}}}, 
+          it will NOT work! You MUST use the aggregation pattern above!
        
        2. "users who haven't completed [modules published in time range]"
           → This means: users who haven't completed modules that were published in that range
@@ -325,6 +355,18 @@ CRITICAL RULES:
 2. NEVER include fake data or numbers in your response
 3. NEVER guess what the results might be
 4. Generate the query structure that will retrieve the requested data
+
+🔴🔴🔴 CRITICAL PATTERN DETECTION - READ THIS FIRST! 🔴🔴🔴
+
+If the user asks about "users who haven't completed" / "who hasn't completed" / "users who didn't complete" 
+WITH a time range (e.g., "in the last month", "in November", "this year"), you MUST use the aggregation 
+pattern below. DO NOT use simple filters - they won't work!
+
+Examples that require aggregation:
+- "who hasn't completed any module in the last month"
+- "users who haven't completed any module in November"
+- "who didn't complete any training this year"
+- "users who haven't finished any module in the past 30 days"
 
 {schema_context}
 
@@ -486,8 +528,13 @@ User wants ONE primary number (count, total, etc.)
 
 MANDATORY FILTERS TO INCLUDE:
   - ALWAYS: {{"term": {{"user_status": 5}}}}     ← Active users only!
-  - ALWAYS: {{"term": {{"assigned_status": 0}}}} ← Assigned records only!
+  - For completion/assignment queries: {{"term": {{"assigned_status": 0}}}} ← Assigned records only!
   - If asking about completions: {{"term": {{"completed_status": 1}}}}
+
+🔴 CRITICAL: For ANY query about completions, modules completed, or assignments:
+  - You MUST include {{"term": {{"assigned_status": 0}}}} in the filter
+  - This ensures we only count assigned modules, not unassigned ones
+  - Examples: "how many modules has [user] completed", "total completions", "modules completed by [user]"
 
 🔴 CRITICAL DISTINCTION - "total completions" vs "unique modules":
   - "total completions" / "total module completions" / "how many completions"
@@ -495,20 +542,46 @@ MANDATORY FILTERS TO INCLUDE:
     → Use: {{"value_count": {{"field": "_id"}}}} OR get total from query result
     → DO NOT use cardinality on mid (that counts unique modules, not total records!)
   
-  - "unique modules completed" / "how many unique modules"
+  - "unique modules completed" / "how many unique modules" / "how many modules has [user] completed"
     → COUNT UNIQUE MODULES (use cardinality on mid)
+    → For specific users: filter by user name/email, then count unique modules
 
 CRITICAL - Use correct ID fields:
   - For unique USERS/LEARNERS: use "uid" (NOT email_addr)
   - For unique MODULES: use "mid" (NOT module_name)
+
+Query pattern for "how many modules has [user] completed" (e.g., "how many modules has tanuj completed"):
+{{
+  "size": 0,
+  "query": {{
+    "bool": {{
+      "filter": [
+        {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
+        {{"term": {{"completed_status": 1}}}},
+        {{"bool": {{
+          "should": [
+            {{"match": {{"first_name": {{"query": "tanuj", "fuzziness": "AUTO"}}}}}},
+            {{"match": {{"last_name": {{"query": "tanuj", "fuzziness": "AUTO"}}}}}}
+          ],
+          "minimum_should_match": 1
+        }}}}
+      ]
+    }}
+  }},
+  "aggs": {{
+    "unique_modules": {{ "cardinality": {{ "field": "mid" }} }}
+  }}
+}}
 
 Query pattern for "total completions" (COUNT ALL RECORDS):
 {{
   "size": 0,
   "query": {{
     "bool": {{
-      "must": [
+      "filter": [
         {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
         {{"term": {{"completed_status": 1}}}}
       ]
     }}
@@ -523,8 +596,9 @@ Query pattern for counting unique users who completed:
   "size": 0,
   "query": {{
     "bool": {{
-      "must": [
+      "filter": [
         {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
         {{"term": {{"completed_status": 1}}}}
       ]
     }}
@@ -534,12 +608,14 @@ Query pattern for counting unique users who completed:
   }}
 }}
 
-Query pattern for counting unique modules:
+Query pattern for counting unique modules (when NOT about completions):
 {{
   "size": 0,
   "query": {{
     "bool": {{
-      "must": [{{"term": {{"user_status": 5}}}}]
+      "filter": [
+        {{"term": {{"user_status": 5}}}}
+      ]
     }}
   }},
   "aggs": {{
@@ -573,6 +649,11 @@ Query pattern:
 RESPONSE TYPE: TABLE (List of Records)
 User wants to see actual data rows.
 
+MANDATORY FILTERS FOR COMPLETION/ASSIGNMENT QUERIES:
+  - ALWAYS: {{"term": {{"user_status": 5}}}}     ← Active users only!
+  - For completion/assignment queries: {{"term": {{"assigned_status": 0}}}} ← Assigned records only!
+  - If asking about completions: {{"term": {{"completed_status": 1}}}}
+
 CRITICAL - When to use COLLAPSE for unique results:
 
 USE COLLAPSE when asking about ENTITY ATTRIBUTES (one record per entity):
@@ -595,21 +676,43 @@ Query pattern (with collapse for unique users):
   "size": 50,
   "collapse": {{"field": "uid"}},
   "_source": ["email_addr", "first_name", "module_name", "city", "completed_status"],
-  "query": {{ /* filters */ }},
+  "query": {{
+    "bool": {{
+      "filter": [
+        {{"term": {{"user_status": 5}}}}
+      ]
+    }}
+  }},
   "sort": [{{ "created_on": "desc" }}]
 }}
 
-Query pattern (without collapse for activities):
+Query pattern (without collapse for activities/completions):
 {{
   "size": 50,
   "_source": ["email_addr", "first_name", "module_name", "city", "completed_status"],
-  "query": {{ /* filters */ }},
+  "query": {{
+    "bool": {{
+      "filter": [
+        {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
+        {{"term": {{"completed_status": 1}}}}
+      ]
+    }}
+  }},
   "sort": [{{ "created_on": "desc" }}]
 }}""",
 
         ResponseType.BAR_CHART: """
 RESPONSE TYPE: BAR_CHART (Grouped Data / Rankings)
-User wants data broken down by category or ranked (e.g., "which module has most completions")
+User wants data broken down by category or ranked (e.g., "which module has most completions", "graph of most completed modules", "which user has completed the most modules")
+
+🔴 CRITICAL: When user asks for rankings, "which X has most/least", "top X", or a "graph" or "chart", you MUST:
+  1. Set response_type to "bar_chart" (or appropriate chart type)
+  2. Generate a query with size: 0 and aggregations
+  3. Use terms aggregation on the grouping field (module_name, email_addr, city, etc.)
+  4. Include a cardinality aggregation to count unique entities
+  5. Order by the count (descending for "most", ascending for "least")
+  6. Use top_hits to get display fields (names, emails) for the results
 
 MANDATORY FILTERS:
   - ALWAYS: {{"term": {{"user_status": 5}}}}     ← Active users only!
@@ -622,22 +725,70 @@ CRITICAL - For grouping (USE NAME FIELDS SO CHART SHOWS NAMES):
   - Count unique users with: {{"cardinality": {{"field": "uid"}}}}
   - Count unique modules with: {{"cardinality": {{"field": "mid"}}}}
 
-Query pattern for "which module has most completions":
+Query pattern for "which module has most completions" OR "graph of most completed modules":
 {{
   "size": 0,
   "query": {{
     "bool": {{
-      "must": [
+      "filter": [
         {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
         {{"term": {{"completed_status": 1}}}}
       ]
     }}
   }},
   "aggs": {{
     "by_module": {{
-      "terms": {{ "field": "module_name", "size": 10, "order": {{"unique_users": "desc"}} }},
+      "terms": {{ 
+        "field": "module_name", 
+        "size": 10, 
+        "order": {{"unique_users": "desc"}} 
+      }},
       "aggs": {{
-        "unique_users": {{ "cardinality": {{ "field": "uid" }} }}
+        "unique_users": {{ 
+          "cardinality": {{ "field": "uid" }} 
+        }}
+      }}
+    }}
+  }}
+}}
+
+🔴 CRITICAL FOR CHARTS:
+- ALWAYS use size: 0 when user asks for a "graph" or "chart"
+- ALWAYS include aggregations (aggs) - charts need aggregations, not hits!
+- Group by NAME fields (module_name, city, etc.) so chart shows readable labels
+- Count with cardinality on ID fields (uid, mid) inside the aggregation
+- Order by the count field (desc for "most", asc for "least")
+
+Query pattern for "which user has completed the most modules" OR "top users by module completions":
+{{
+  "size": 0,
+  "query": {{
+    "bool": {{
+      "filter": [
+        {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
+        {{"term": {{"completed_status": 1}}}}
+      ]
+    }}
+  }},
+  "aggs": {{
+    "by_user": {{
+      "terms": {{ 
+        "field": "email_addr", 
+        "size": 10, 
+        "order": {{"unique_modules": "desc"}} 
+      }},
+      "aggs": {{
+        "unique_modules": {{ 
+          "cardinality": {{ "field": "mid" }} 
+        }},
+        "user_info": {{
+          "top_hits": {{
+            "size": 1,
+            "_source": ["uid", "email_addr", "first_name", "last_name", "designation"]
+          }}
+        }}
       }}
     }}
   }}
@@ -648,8 +799,9 @@ Query pattern for completions by city:
   "size": 0,
   "query": {{
     "bool": {{
-      "must": [
+      "filter": [
         {{"term": {{"user_status": 5}}}},
+        {{"term": {{"assigned_status": 0}}}},
         {{"term": {{"completed_status": 1}}}}
       ]
     }}
@@ -892,69 +1044,59 @@ The system will provide schema documentation directly.""",
         cls,
         user_message: str,
         time_period: Optional[TimePeriod] = None,
-        entities: Optional[Dict[str, Any]] = None,
+        time_field: str = 'created_on',
         active_filters: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Build the user prompt with extracted context.
+        Build the user prompt. Bedrock will handle all entity extraction and query building
+        based on the comprehensive rules in the system prompt.
         
         Args:
             user_message: The user's natural language query
             time_period: Parsed time period from TimeHandler
-            entities: Extracted entities from SemanticFieldMapper
+            time_field: Suggested date field to use (Bedrock should determine the correct one based on context)
             active_filters: Active filters from conversation context
             
         Returns:
-            Enhanced user prompt for the LLM
+            User prompt for the LLM
         """
         parts = [f"USER QUERY: {user_message}"]
         
+        # Detect "haven't completed" pattern and add specific reminder
+        message_lower = user_message.lower()
+        has_havent_completed = any(phrase in message_lower for phrase in [
+            "haven't completed", "havent completed", "hasn't completed", "hasnt completed",
+            "didn't complete", "didnt complete", "hasn't finished", "hasnt finished"
+        ])
+        has_time_range = time_period and not time_period.is_lifetime
+        
+        if has_havent_completed and has_time_range:
+            parts.append(f"""
+🔴🔴🔴 CRITICAL: This is a "haven't completed in time range" query!
+You MUST use the aggregation pattern from the system prompt (pattern #1 in DATE FIELD RULES).
+DO NOT use simple filters - they won't work!
+Required structure:
+- size: 0
+- query.filter: only user_status=5 and cmid=1
+- aggs.users: terms aggregation on uid
+- aggs.users.aggs.assigned: filter for assigned_status=0
+- aggs.users.aggs.recent_completions: filter for completed_status=1 AND completed_date in time range
+- aggs.users.aggs.only_inactive_users: bucket_selector with script "params.assignedCount > 0 && params.recentCompletedCount == 0"
+- aggs.users.aggs.user_info: top_hits to get user details
+
+Time range: {time_period.start_timestamp} to {time_period.end_timestamp}
+Use completed_date for the time range in recent_completions filter.""")
+        
         # Add time period context if detected
         if time_period and not time_period.is_lifetime:
-            # Determine the appropriate date field
-            time_field = 'created_on'  # Default
-            if entities and entities.get('time_field_override'):
-                time_field = entities['time_field_override']
-            
-            parts.append(f"""
+            if not (has_havent_completed and has_time_range):  # Don't duplicate if already added above
+                parts.append(f"""
 TIME FILTER DETECTED: {time_period.description}
-Date field to use: {time_field}
+Suggested date field: {time_field} (but determine the correct date field based on the query context - see DATE FIELD RULES)
 Use this date range in your query:
-{{"range": {{"{time_field}": {{"gte": {time_period.start_timestamp}, "lt": {time_period.end_timestamp}}}}}}}""")
+{{"range": {{"<DATE_FIELD>": {{"gte": {time_period.start_timestamp}, "lt": {time_period.end_timestamp}}}}}}}""")
         elif time_period and time_period.is_lifetime:
             parts.append("\nTIME: No specific time mentioned - query ALL data (no date filter)")
-        
-        # Add extracted entities
-        if entities:
-            parts.append("\nEXTRACTED ENTITIES:")
-            if entities.get('person_name'):
-                person_name = entities['person_name']
-                # Detect if it's an email or a name
-                is_email = '@' in str(person_name)
-                if is_email:
-                    parts.append(f"  - Email address: {person_name} → Use {{'match': {{'email_addr': {{'query': '{person_name}'}}}}}}")
-                else:
-                    parts.append(f"  - Person name: {person_name} → Use {{'bool': {{'should': [{{'match': {{'first_name': {{'query': '{person_name}', 'fuzziness': 'AUTO'}}}}}}, {{'match': {{'last_name': {{'query': '{person_name}', 'fuzziness': 'AUTO'}}}}}}], 'minimum_should_match': 1}}}}")
-                    parts.append(f"    ⚠️ DO NOT use email_addr for person names! Only use first_name and last_name.")
-            if entities.get('cities'):
-                parts.append(f"  - Cities: {entities['cities']}")
-            if entities.get('countries'):
-                parts.append(f"  - Countries: {entities['countries']}")
-            if 'completion_filter' in entities:
-                status = "completed (completed_status=1)" if entities['completion_filter'] == 1 else "not completed (completed_status=0)"
-                parts.append(f"  - Completion status: {status}")
-            if entities.get('user_status_filter') is not None:
-                parts.append(f"  - User status: {entities['user_status_filter']}")
-            if entities.get('module_status_filter') is not None:
-                parts.append(f"  - Module status: {entities['module_status_filter']}")
-            if entities.get('assigned_status_filter') is not None:
-                parts.append(f"  - Assignment status: {entities['assigned_status_filter']}")
-            if entities.get('limit'):
-                parts.append(f"  - Limit: top {entities['limit']}")
-            if entities.get('group_by'):
-                parts.append(f"  - Group by: {entities['group_by']}")
-            if entities.get('time_field_override'):
-                parts.append(f"  - Date field: {entities['time_field_override']}")
         
         # Add active filters from conversation
         if active_filters:
@@ -962,7 +1104,7 @@ Use this date range in your query:
             for filter_type, filter_info in active_filters.items():
                 parts.append(f"  - {filter_type}: {filter_info}")
         
-        parts.append("\nGenerate the OpenSearch query JSON now.")
+        parts.append("\nGenerate the OpenSearch query JSON now. Follow all the rules in the system prompt.")
         
         return '\n'.join(parts)
     

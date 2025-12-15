@@ -331,6 +331,54 @@ class ResponseValidator:
         """
         total = query_results.get('total', 0)
         aggregations = query_results.get('aggregations', {})
+        results = query_results.get('results', [])
+        
+        # For chart/ranking queries, aggregations are the primary data
+        is_chart_query = response_type in ['bar_chart', 'pie_chart', 'line_chart'] and len(results) == 0 and aggregations
+        
+        if is_chart_query:
+            # Extract top result from aggregations
+            for agg_name, agg_value in aggregations.items():
+                if isinstance(agg_value, dict) and 'buckets' in agg_value:
+                    buckets = agg_value.get('buckets', [])
+                    if buckets:
+                        top_bucket = buckets[0]
+                        key = top_bucket.get('key', 'Unknown')
+                        # Get count from nested cardinality or doc_count
+                        count = top_bucket.get('doc_count', 0)
+                        for nested_key, nested_value in top_bucket.items():
+                            if nested_key not in ['key', 'doc_count'] and isinstance(nested_value, dict):
+                                if 'value' in nested_value:
+                                    count = nested_value['value']
+                                    break
+                        
+                        # Check for user info in top_hits (check multiple possible names)
+                        for top_hits_name in ['user_info', 'user_details', 'top_hits']:
+                            if top_hits_name in top_bucket and isinstance(top_bucket[top_hits_name], dict):
+                                hits = top_bucket[top_hits_name].get('hits', {}).get('hits', [])
+                                if hits:
+                                    source = hits[0].get('_source', {})
+                                    first_name = source.get('first_name', '')
+                                    last_name = source.get('last_name', '')
+                                    email = source.get('email_addr', key)
+                                    if first_name or last_name:
+                                        key = f"{first_name} {last_name}".strip() or email
+                                        break
+                        
+                        # Always show the key (email) even if no name found
+                        if '@' in str(key):
+                            # Key is already an email, use it as-is
+                            pass
+                        
+                        # Detect if this is a user query (key is email or agg_name contains 'user')
+                        is_user_query = '@' in str(key) or 'user' in agg_name.lower() or 'by_user' in agg_name.lower()
+                        
+                        if is_user_query and 'unique_modules' in str(top_bucket):
+                            return f"{key} has completed the most modules with {int(count):,} unique modules completed."
+                        elif is_user_query:
+                            return f"{key} has the highest count with {int(count):,}."
+                        else:
+                            return f"Top result: {key} with {int(count):,}."
         
         parts = [f"Found {total:,} records"]
         

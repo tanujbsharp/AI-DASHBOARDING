@@ -991,9 +991,31 @@ export class ChatInterfaceComponent {
     for (const value of Object.values(aggregations)) {
       if (value && typeof value === 'object' && 'buckets' in value && Array.isArray(value.buckets)) {
         for (const bucket of value.buckets.slice(0, 15)) { // Limit to 15 for display
+          // Extract count value - prefer nested cardinality aggregations over doc_count
+          let count = 0;
+          // Check for _count field (added by backend for nested cardinality)
+          if (bucket._count !== undefined) {
+            count = bucket._count;
+          } else {
+            // Check for nested cardinality aggregations (unique_users, unique_modules, etc.)
+            let foundNested = false;
+            for (const [nestedKey, nestedValue] of Object.entries(bucket)) {
+              if (nestedKey === 'key' || nestedKey === 'doc_count' || nestedKey.startsWith('_')) continue;
+              if (nestedValue && typeof nestedValue === 'object' && 'value' in nestedValue) {
+                count = nestedValue.value;
+                foundNested = true;
+                break;
+              }
+            }
+            // Fall back to doc_count if no nested aggregation found
+            if (!foundNested) {
+              count = bucket.doc_count || 0;
+            }
+          }
+          
           buckets.push({
             key: bucket.key || 'Unknown',
-            count: bucket.doc_count || 0
+            count: count
           });
         }
         break; // Only process first terms aggregation

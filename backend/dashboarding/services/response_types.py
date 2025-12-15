@@ -199,11 +199,26 @@ class ResponseTypeDetector:
         # 3) BAR_CHART patterns - BREAKDOWN / GROUP BY
         'bar_chart': {
             'patterns': [
+                # Explicit chart/graph requests
+                r'\bgraph\s+of\b',
+                r'\bchart\s+of\b',
+                r'\bgraph\s+(of|showing|for)\b',
+                r'\bchart\s+(of|showing|for)\b',
+                r'\b(show|give|generate|create|display)\s+(me\s+)?(a\s+)?(graph|chart)\b',
+                r'\b(graph|chart)\s+(of|for|showing)\b',
+                # "Which X has most/least" queries
+                r'\bwhich\s+(user|users?|module|modules?|person|people)\s+(has|have)\s+(the\s+)?(most|least|fewest)',
+                r'\bwhich\s+(user|users?|module|modules?|person|people)\s+completed\s+(the\s+)?(most|least|fewest)',
                 # Completion rate queries that are rankings (not comparisons)
                 r'\btop\s+\d*\s*(?:modules?|trainings?|courses?)\s+by\s+completion\s+rate',
                 r'\btop\s+(?:modules?|trainings?|courses?)\s+by\s+completion\s+rate',
                 r'completion\s+rate\s+by\s+(?:module|training|course)',
                 r'\bby\s+completion\s+rate\b',
+                # Ranking queries (most/least/top/best)
+                r'\bmost\s+(completed|completions|popular|common|modules?)\b',
+                r'\bleast\s+(completed|completions|popular|common|modules?)\b',
+                r'\bwhat\s+(are\s+)?(the\s+)?(most|top|best|highest)\s+(completed|completions)',
+                r'\bwhat\s+(are\s+)?(the\s+)?(least|worst|lowest|bottom)\s+(completed|completions)',
                 r'\bby\s+(city|cities|country|countries|skill|skills|product|products|module|modules|department|team|region|location)\b',
                 r'\bbreakdown\s+by\b',
                 r'\bdistribution\b',

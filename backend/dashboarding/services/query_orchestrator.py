@@ -18,7 +18,6 @@ from django.conf import settings
 
 from .opensearch_client import OpenSearchClient
 from .time_handler import TimeHandler, TimePeriod
-from .semantic_mapper import SemanticFieldMapper
 from .response_types import ResponseType, ResponseTypeDetector
 from .response_validator import ResponseValidator
 from .conversation_context import (
@@ -139,30 +138,19 @@ class QueryOrchestrator:
             context = self.context_manager.get_or_create(session_id)
             context.add_message("user", user_message)
             
-            # Step 2: Extract intent using helper classes
+            # Step 2: Extract basic intent using helper classes
             time_period = TimeHandler.parse(user_message)
             response_type = ResponseTypeDetector.detect(user_message)
-            entities = SemanticFieldMapper.extract_entities(user_message)
             
-            # CRITICAL: Force TABLE response type for zero completions queries
-            # These queries need to show a list of users, so they must be TABLE type
-            # regardless of what the detector thinks (e.g., "who hasn't" might be detected as KPI_WIDGET)
-            if entities and entities.get('zero_completions_in_range'):
-                response_type = ResponseType.TABLE
-                logger.info("Forcing TABLE response type for zero completions query")
-            
-            # Update context with new filters
-            time_field_override = entities.get('time_field_override')
-            if not time_field_override:
-                time_field_override = TimeHandler.detect_time_field_hint(user_message)
+            # Detect time field hint if available
+            time_field_override = TimeHandler.detect_time_field_hint(user_message)
             if not time_field_override:
                 time_field_override = 'created_on'
-            entities['time_field_override'] = time_field_override
 
             self.context_manager.update_from_message(
                 context, 
                 user_message, 
-                entities, 
+                {},  # No entities - Bedrock will handle everything
                 time_period.__dict__ if time_period else None,
                 time_field=time_field_override
             )
@@ -181,65 +169,16 @@ class QueryOrchestrator:
             if response_type == ResponseType.DATA_DICTIONARY:
                 return self._handle_data_dictionary_request(schema, context)
             
-            # Step 3b: Check for ambiguous terms that need clarification (Section I)
-            clarification = self._check_for_clarification_needed(entities, user_message)
-            if clarification:
-                context.add_message("assistant", clarification)
-                return {
-                    'type': 'clarification',
-                    'message': clarification,
-                    'needs_clarification': True,
-                    'ambiguous_terms': entities.get('ambiguous_terms', [])
-                }
-            
-            # Step 4: Determine if this query should bypass LLM (module intents or follow-up lists)
-            query_result = None
-            module_intent = entities.get('module_intent')
-
-            if entities.get('is_ranking_query'):
-                # Handle "which module has most completions" type queries
-                query_result = self._build_ranking_query(
-                    entities=entities,
-                    time_period=effective_time_period,
-                    context=context,
-                    user_message=user_message
-                )
-            elif module_intent:
-                query_result = self._build_module_intent_query(
-                    module_intent=module_intent,
-                    time_period=effective_time_period,
-                    entities=entities,
-                    context=context,
-                    response_type=response_type
-                )
-            else:
-                comparison_type = entities.get('comparison_type')
-                if comparison_type == 'assigned_vs_completed':
-                    query_result = self._build_assignment_vs_completion_query(
-                        context=context
-                    )
-                else:
-                    # Follow-up functionality disabled per user request
-                    # follow_up_override = self._maybe_build_follow_up_query(
-                    #     user_message=user_message,
-                    #     response_type=response_type,
-                    #     entities=entities,
-                    #     context=context
-                    # )
-                    # if follow_up_override:
-                    #     query_result = follow_up_override
-                    follow_up_override = None
-
-            if query_result is None:
-                # Generate query via LLM (Phase 1)
-                query_result = self._generate_query(
-                    user_message=user_message,
-                    schema=schema,
-                    response_type=response_type,
-                    time_period=effective_time_period,
-                    entities=entities,
-                    context=context
-                )
+            # Step 4: Generate query via LLM (Phase 1)
+            # Let Bedrock handle all query generation based on the comprehensive prompt rules
+            query_result = self._generate_query(
+                user_message=user_message,
+                schema=schema,
+                response_type=response_type,
+                time_period=effective_time_period,
+                context=context,
+                time_field=time_field_override
+            )
             
             if 'error' in query_result:
                 # Include the query if it was generated before error
@@ -255,46 +194,30 @@ class QueryOrchestrator:
             # Deduplicate filters to prevent duplicate clauses
             self._deduplicate_filters(query_payload)
             
-            # Fix "total completions" queries that incorrectly use cardinality on mid
-            # "total completions" should count ALL records, not unique modules
-            if entities and entities.get('count_total_records'):
-                self._fix_total_completions_query(query_payload)
+            # CRITICAL: Detect and fix "haven't completed in time range" queries
+            # Bedrock often generates simple filters instead of the required aggregation pattern
+            # This MUST happen BEFORE applying structured filters to prevent time filters at top level
+            is_havent_completed_query = self._is_havent_completed_in_time_query(user_message, effective_time_period)
+            if is_havent_completed_query:
+                logger.info("Detected 'haven't completed in time range' pattern - fixing query with aggregation pattern")
+                self._fix_havent_completed_in_time_query(query_payload, effective_time_period, user_message)
             
-            # Fix person name queries that incorrectly use email_addr instead of first_name/last_name
-            if entities and entities.get('person_name'):
-                person_name = str(entities['person_name'])
-                # Only fix if it's NOT an email (doesn't contain @)
-                if '@' not in person_name:
-                    self._fix_person_name_query(query_payload, person_name)
-            
-            # Handle "users who haven't completed any module in [time range]" queries
-            # This requires user-level aggregation, not row-level filtering
-            # Must be done BEFORE structured filters to replace the query entirely
-            skip_structured_filters = False
-            if entities and entities.get('zero_completions_in_range') and effective_time_period and not effective_time_period.is_lifetime:
-                self._build_zero_completions_in_range_query(query_payload, effective_time_period, entities)
-                skip_structured_filters = True  # Aggregation query handles everything, skip filters
-            
-            # Handle count threshold queries (e.g., "users who have finished more than 5 modules")
-            if entities and entities.get('count_threshold') is not None:
-                # Pass original message to detect if it's about modules
-                if 'original_message' not in entities:
-                    entities['original_message'] = user_message
-                self._apply_count_threshold(query_payload, entities)
-            
-            # Handle "latest" / "most recent" queries
-            # These should return only the most recent completed module, sorted by completed_date descending
-            # BUT: Skip if this is a zero completions query (they have incompatible filter requirements)
-            if entities and entities.get('latest_query') and not entities.get('zero_completions_in_range'):
-                self._fix_latest_query(query_payload, entities)
-            
-            # Handle completion rate queries - fix invalid ordering by pipeline aggregation
-            if entities and entities.get('completion_rate_query'):
-                self._fix_completion_rate_query(query_payload, entities)
-            
-            # Handle "what modules were completed" queries - ensure they use aggregations for unique modules
-            if entities and entities.get('unique_modules_query'):
-                self._fix_unique_modules_query(query_payload, entities)
+            # CRITICAL: Fix chart queries that don't have aggregations
+            # Bedrock sometimes generates queries with size > 0 (hits) instead of size: 0 with aggregations
+            if response_type in [ResponseType.BAR_CHART, ResponseType.PIE_CHART, ResponseType.LINE_CHART]:
+                query_body = query_payload.get('query', {})
+                if isinstance(query_body, dict):
+                    has_aggs = 'aggs' in query_body and isinstance(query_body.get('aggs'), dict) and len(query_body.get('aggs', {})) > 0
+                    query_size = query_body.get('size', 0)
+                    if not has_aggs or query_size > 0:
+                        logger.warning(f"Chart query detected ({response_type.value}) but missing aggregations (has_aggs={has_aggs}) or wrong size (size={query_size}) - converting to aggregation query")
+                        self._fix_chart_query(query_payload, response_type, user_message, effective_time_period)
+                        # Verify the fix worked
+                        query_body_after = query_payload.get('query', {})
+                        if isinstance(query_body_after, dict):
+                            has_aggs_after = 'aggs' in query_body_after and isinstance(query_body_after.get('aggs'), dict) and len(query_body_after.get('aggs', {})) > 0
+                            size_after = query_body_after.get('size', 0)
+                            logger.info(f"After fix: has_aggs={has_aggs_after}, size={size_after}")
             
             # CRITICAL: Remove collapse from any aggregation query (size: 0)
             # Collapse only works on hits, not aggregations. When size: 0, there are no hits, so collapse is useless.
@@ -310,124 +233,35 @@ class QueryOrchestrator:
                         logger.warning("Removed collapse from query with aggregations (collapse only works on hits, not aggregations)")
                         query_body.pop('collapse')
             
-            # CRITICAL: Final safeguard - if this is a zero completions query, ensure prohibited filters
-            # are removed from top-level (even if other methods added them back)
-            if entities and entities.get('zero_completions_in_range') and effective_time_period and not effective_time_period.is_lifetime:
+            # Apply structured filters (time, context filters)
+            # SKIP time filters for "haven't completed" queries - time range is only in aggregation!
+            self._apply_structured_filters(
+                query_payload=query_payload,
+                time_period=effective_time_period if not is_havent_completed_query else None,  # Skip time filter for haven't completed queries
+                context=context,
+                time_field=time_field_override,
+                entities={},  # No entities - Bedrock handles everything
+                user_message=user_message
+            )
+            
+            # CRITICAL: Final cleanup for "haven't completed" queries - remove any time filters that might have been added
+            if is_havent_completed_query:
                 query_body = query_payload.get('query', {})
                 if isinstance(query_body, dict):
                     self._remove_prohibited_filters_from_top_level(query_body)
-            
-            if not skip_structured_filters:
-                self._apply_structured_filters(
-                    query_payload=query_payload,
-                    time_period=effective_time_period,
-                    context=context,
-                    time_field=time_field_override,
-                    entities=entities,
-                    user_message=user_message
-                )
-            
-            # CRITICAL: Final cleanup for zero completions queries - remove any prohibited filters
-            # that might have been added by _apply_structured_filters or other methods
-            if entities and entities.get('zero_completions_in_range') and effective_time_period and not effective_time_period.is_lifetime:
-                query_body = query_payload.get('query', {})
-                if isinstance(query_body, dict):
-                    self._remove_prohibited_filters_from_top_level(query_body)
-                    # Verify the cleanup worked
-                    query = query_body.get('query', {})
-                    if isinstance(query, dict):
-                        bool_query = query.get('bool', {})
-                        if isinstance(bool_query, dict):
-                            filter_clauses = bool_query.get('filter', [])
-                            # Check for prohibited filters
-                            for clause in filter_clauses:
-                                if isinstance(clause, dict):
-                                    if 'term' in clause and isinstance(clause.get('term'), dict):
-                                        if 'completed_status' in clause['term'] or 'assigned_status' in clause['term']:
-                                            logger.error(f"CRITICAL: Prohibited filter still present after cleanup: {clause}")
-                                    if 'range' in clause and isinstance(clause.get('range'), dict):
-                                        if 'completed_date' in clause['range']:
-                                            logger.error(f"CRITICAL: Prohibited range filter still present after cleanup: {clause}")
             
             # Sanitize again after applying filters (in case filters added unsupported constructs)
             self._sanitize_query_payload(query_payload)
             
-            # One more cleanup after sanitize (in case sanitize modified something)
-            if entities and entities.get('zero_completions_in_range') and effective_time_period and not effective_time_period.is_lifetime:
+            # CRITICAL: Final cleanup for "haven't completed" queries - remove any time filters that might have been added
+            # This MUST happen after all filter application to ensure no completed_date filters at top level
+            if is_havent_completed_query:
                 query_body = query_payload.get('query', {})
                 if isinstance(query_body, dict):
                     self._remove_prohibited_filters_from_top_level(query_body)
+                    logger.info("Final cleanup: Removed any prohibited filters from top-level for haven't completed query")
 
             # Step 5: Execute query against OpenSearch
-            # CRITICAL: For zero completions queries, verify aggregation is present AND top-level filters are correct
-            if entities and entities.get('zero_completions_in_range'):
-                query_body = query_payload.get('query', {})
-                if 'aggs' not in query_body:
-                    logger.error("CRITICAL ERROR: Zero completions query is missing 'aggs' section! Query will fail.")
-                elif 'users' not in query_body.get('aggs', {}):
-                    logger.error("CRITICAL ERROR: Zero completions query is missing 'users' aggregation! Query will fail.")
-                else:
-                    logger.info("Zero completions query has correct aggregation structure")
-                
-                # FINAL VERIFICATION: Check top-level filters - must ONLY have user_status and cmid
-                query = query_body.get('query', {})
-                if isinstance(query, dict):
-                    bool_query = query.get('bool', {})
-                    if isinstance(bool_query, dict):
-                        filter_clauses = bool_query.get('filter', [])
-                        prohibited_found = []
-                        for clause in filter_clauses:
-                            if isinstance(clause, dict):
-                                if 'term' in clause and isinstance(clause.get('term'), dict):
-                                    term_dict = clause['term']
-                                    if 'completed_status' in term_dict:
-                                        prohibited_found.append('completed_status')
-                                    if 'assigned_status' in term_dict:
-                                        prohibited_found.append('assigned_status')
-                                if 'range' in clause and isinstance(clause.get('range'), dict):
-                                    if 'completed_date' in clause['range']:
-                                        prohibited_found.append('completed_date range')
-                        
-                        if prohibited_found:
-                            logger.error(f"CRITICAL: Prohibited filters found in top-level query: {prohibited_found}")
-                            logger.error(f"Removing them now as final safeguard...")
-                            self._remove_prohibited_filters_from_top_level(query_body)
-                        else:
-                            logger.info("Zero completions query has correct top-level filters (only user_status and cmid)")
-            
-            # FINAL FINAL SAFEGUARD: Remove collapse and ensure correct structure for unique_modules_query
-            query_body = query_payload.get('query', {})
-            if isinstance(query_body, dict):
-                # Remove collapse if present
-                if 'collapse' in query_body:
-                    logger.warning("FINAL SAFEGUARD: Removed collapse before query execution")
-                    query_body.pop('collapse')
-                
-                # If this is a unique_modules_query, ensure structure is correct
-                if entities and entities.get('unique_modules_query'):
-                    if 'aggs' in query_body and isinstance(query_body.get('aggs'), dict):
-                        modules_agg = query_body['aggs'].get('modules', {})
-                        if isinstance(modules_agg, dict):
-                            # Ensure unique_users aggregation exists
-                            sub_aggs = modules_agg.get('aggs', {})
-                            if 'unique_users' not in sub_aggs:
-                                logger.warning("FINAL SAFEGUARD: Adding missing unique_users aggregation")
-                                if not isinstance(sub_aggs, dict):
-                                    modules_agg['aggs'] = {}
-                                    sub_aggs = modules_agg['aggs']
-                                sub_aggs['unique_users'] = {'cardinality': {'field': 'uid'}}
-                            
-                            # Ensure order is correct
-                            terms_agg = modules_agg.get('terms', {})
-                            if isinstance(terms_agg, dict) and 'order' not in terms_agg:
-                                logger.warning("FINAL SAFEGUARD: Adding missing order by unique_users")
-                                terms_agg['order'] = {'unique_users': 'desc'}
-                            elif isinstance(terms_agg, dict) and isinstance(terms_agg.get('order'), dict):
-                                order = terms_agg['order']
-                                if 'unique_users' not in order:
-                                    logger.warning("FINAL SAFEGUARD: Fixing order to use unique_users")
-                                    terms_agg['order'] = {'unique_users': 'desc'}
-            
             execution_result = self._execute_query(
                 index_id=query_payload.get('index_id', index_id),
                 query=query_payload.get('query', {})
@@ -441,18 +275,8 @@ class QueryOrchestrator:
                 )
             
             # Extract results from "zero completions in range" aggregation queries
-            if entities and entities.get('zero_completions_in_range'):
+            if self._is_havent_completed_in_time_query(user_message, effective_time_period):
                 self._extract_zero_completions_in_range_results(execution_result)
-            
-            # Fix "latest" query results - ensure total matches count (should be 1)
-            if entities and entities.get('latest_query'):
-                if execution_result.get('success') and execution_result.get('count', 0) == 1:
-                    # For latest queries, total should equal count (1)
-                    execution_result['total'] = 1
-            
-            # Summarize threshold queries into one row per user with module counts
-            if entities and entities.get('count_threshold') is not None:
-                self._summarize_count_threshold_results(execution_result)
             
             # Step 6: Generate response using actual data (Phase 2)
             response = self._generate_response(
@@ -538,16 +362,39 @@ class QueryOrchestrator:
             # CRITICAL: Include aggregations in response for chart visualizations
             # The frontend needs aggregations to display bar charts, pie charts, etc.
             aggregations = execution_result.get('aggregations', {})
-            if aggregations and final_response_type in ['bar_chart', 'pie_chart', 'line_chart']:
-                final_response['aggregations'] = aggregations
-                logger.info(f"Included aggregations in response for {final_response_type} visualization")
-            
-            # Ensure results are present (for zero completions queries, they should be extracted)
-            if entities and entities.get('zero_completions_in_range'):
-                if 'results' not in execution_result or not execution_result.get('results'):
-                    logger.warning(f"Zero completions query has no results! Total: {execution_result.get('total', 0)}, Count: {execution_result.get('count', 0)}")
+            if final_response_type in ['bar_chart', 'pie_chart', 'line_chart']:
+                if aggregations:
+                    # Verify aggregations have buckets for chart rendering
+                    has_buckets = False
+                    for agg_name, agg_value in aggregations.items():
+                        if isinstance(agg_value, dict) and 'buckets' in agg_value:
+                            has_buckets = True
+                            bucket_count = len(agg_value.get('buckets', []))
+                            logger.info(f"Included aggregation '{agg_name}' with {bucket_count} buckets for {final_response_type} visualization")
+                            break
+                    
+                    if not has_buckets:
+                        logger.warning(f"Chart response type ({final_response_type}) but aggregations don't have buckets!")
+                        logger.warning(f"Aggregations structure: {list(aggregations.keys())}")
+                        for name, value in aggregations.items():
+                            logger.warning(f"  {name}: {type(value).__name__}, keys: {list(value.keys()) if isinstance(value, dict) else 'N/A'}")
+                    
+                    final_response['aggregations'] = aggregations
                 else:
-                    logger.info(f"Zero completions query returning {len(execution_result.get('results', []))} users in results array")
+                    logger.error(f"CRITICAL: Chart response type ({final_response_type}) but NO aggregations in execution result!")
+                    logger.error(f"Execution result keys: {list(execution_result.keys())}")
+                    query_body = query_payload.get('query', {})
+                    logger.error(f"Query had aggregations: {'aggs' in query_body if isinstance(query_body, dict) else False}")
+                    logger.error(f"Query size: {query_body.get('size') if isinstance(query_body, dict) else 'N/A'}")
+                    # Still set it to empty dict so frontend knows to expect aggregations
+                    final_response['aggregations'] = {}
+            else:
+                # Include aggregations even for non-chart types if they exist (might be useful)
+                if aggregations:
+                    final_response['aggregations'] = aggregations
+            
+            # Results should be present in execution_result
+            # Bedrock handles all query types including zero completions queries
             
             return final_response
             
@@ -563,8 +410,8 @@ class QueryOrchestrator:
         schema: Dict[str, Any],
         response_type: ResponseType,
         time_period: Optional[TimePeriod],
-        entities: Dict[str, Any],
-        context: ConversationContext
+        context: ConversationContext,
+        time_field: str = 'created_on'
     ) -> Dict[str, Any]:
         """
         Phase 1: Generate OpenSearch query using LLM.
@@ -578,11 +425,11 @@ class QueryOrchestrator:
             conversation_context=""  # Disabled - don't use previous query context
         )
         
-        # Build user prompt with extracted context
+        # Build user prompt - Bedrock will handle all entity extraction and query building
         user_prompt = QueryPromptBuilder.build_user_prompt(
             user_message=user_message,
             time_period=time_period,
-            entities=entities,
+            time_field=time_field,
             active_filters=context.get_active_filters_dict()
         )
         
@@ -634,7 +481,6 @@ class QueryOrchestrator:
         self,
         user_message: str,
         response_type: ResponseType,
-        entities: Dict[str, Any],
         context: ConversationContext
     ) -> Optional[Dict[str, Any]]:
         """Handle follow-up list requests (e.g., 'who are these users?')."""
@@ -645,7 +491,7 @@ class QueryOrchestrator:
         if not self._is_follow_up_list_request(user_message, response_type, last_query):
             return None
 
-        return self._build_follow_up_list_query(last_query, entities, context)
+        return self._build_follow_up_list_query(last_query, context)
     
     def _generate_response(
         self,
@@ -757,11 +603,10 @@ class QueryOrchestrator:
     def _build_follow_up_list_query(
         self,
         last_query: QueryRecord,
-        entities: Dict[str, Any],
         context: ConversationContext
     ) -> Dict[str, Any]:
         """Build a deterministic query that lists the actual entities referenced earlier."""
-        size = entities.get('limit') or last_query.primary_entity_count or 100
+        size = last_query.primary_entity_count or 100
         size = min(size, 200)
 
         base_query = last_query.filter_query or last_query.query.get('query') or {"match_all": {}}
@@ -826,7 +671,6 @@ class QueryOrchestrator:
         self,
         module_intent: str,
         time_period: Optional[TimePeriod],
-        entities: Dict[str, Any],
         context: ConversationContext,
         response_type: ResponseType
     ) -> Dict[str, Any]:
@@ -878,10 +722,11 @@ class QueryOrchestrator:
         # Smart detection: only show table if user EXPLICITLY asks for a list
         # "which modules were published" = wants COUNT (KPI)
         # "list which modules were published" = wants LIST (TABLE)
-        wants_table = entities.get('wants_list', False)
+        # Check if user wants a table/list (Bedrock should have set response_type correctly)
+        wants_table = response_type == ResponseType.TABLE
         
         if wants_table:
-            size = entities.get('limit') or 200
+            size = 200
             size = max(10, min(size, 500))
             fields = [
                 "module_name",
@@ -919,7 +764,8 @@ class QueryOrchestrator:
             }
         
         # Check if this is a "total completions" query (count all records, not unique modules)
-        count_total_records = entities.get('count_total_records', False)
+        # Check if this is a "total completions" query (count all records, not unique)
+        count_total_records = 'total' in user_message.lower() and 'completion' in user_message.lower()
         
         if count_total_records and module_intent == 'consumed':
             # For "total completions", count ALL records, not unique modules
@@ -962,7 +808,6 @@ class QueryOrchestrator:
     
     def _build_ranking_query(
         self,
-        entities: Dict[str, Any],
         time_period: Optional[TimePeriod],
         context: ConversationContext,
         user_message: str = ""
@@ -976,7 +821,18 @@ class QueryOrchestrator:
         - Use uid for counting unique users
         - Use mid for counting unique modules
         """
-        rank_by = entities.get('rank_by', 'module_name')
+        # Detect what to rank by from the message
+        message_lower = user_message.lower()
+        if 'module' in message_lower or 'training' in message_lower or 'course' in message_lower:
+            rank_by = 'module_name'
+        elif 'user' in message_lower or 'learner' in message_lower:
+            rank_by = 'email_addr'
+        elif 'city' in message_lower:
+            rank_by = 'city'
+        elif 'skill' in message_lower:
+            rank_by = 'skill_name'
+        else:
+            rank_by = 'module_name'  # default
         message_lower = user_message.lower()
         
         # Build the base filter
@@ -1002,7 +858,8 @@ class QueryOrchestrator:
         
         # Add time filter if specified
         if time_period and not time_period.is_lifetime:
-            time_field = entities.get('time_field_override', 'completed_date' if metric_type == 'completions' else 'created_on')
+            # Determine time field based on metric type
+            time_field = 'completed_date' if metric_type == 'completions' else 'created_on'
             must_filters.append({
                 "range": {
                     time_field: {
@@ -1152,22 +1009,14 @@ class QueryOrchestrator:
 
         search_query = query_body.setdefault('query', {"match_all": {}})
         bool_query = self._ensure_bool_query(search_query)
-
-        # CRITICAL: For zero completions queries, DO NOT add ANY filters at top level
-        # The query structure is already built by _build_zero_completions_in_range_query
-        # Adding filters here would break the aggregation logic by filtering out users before aggregation
-        if entities and entities.get('zero_completions_in_range') and time_period and not time_period.is_lifetime:
-            # RETURN IMMEDIATELY - do not add any filters
-            # The aggregation query already has the correct structure (only user_status and cmid at top level)
-            logger.info("Skipping _apply_structured_filters for zero completions query - aggregation handles everything")
-            return
         
         if time_period and not time_period.is_lifetime:
-            # Normal time filter logic - only apply if explicitly requested in current query
-            # DO NOT use stored time filters from context
-            entity_time_field = (entities or {}).get('time_field_override') if entities else None
-            field_name = entity_time_field or time_field or 'created_on'
-            self._ensure_time_filter_clause(bool_query, field_name, time_period)
+            # Apply time filter - Bedrock should have already added the correct date field
+            # But we'll ensure it's there with the suggested field as fallback
+            # NOTE: For "haven't completed" queries, time filters should NOT be at top level
+            # They should only be in the aggregation. This is handled by passing time_period=None
+            # for those queries, so this code won't run.
+            self._ensure_time_filter_clause(bool_query, time_field, time_period)
 
         # Apply inferred filters (cities, completion, products, etc.)
         # Enforce single-tenant scope (cmid=1)
@@ -1177,70 +1026,17 @@ class QueryOrchestrator:
         # This is a core business rule - we only report on active users
         self._append_filter_clause(bool_query, {"term": {"user_status": 5}})
         
-        # CRITICAL: For zero completions queries, DO NOT add assigned_status or completed_status filters
-        # These must ONLY exist in the aggregation, not at top-level
-        if entities and entities.get('zero_completions_in_range'):
-            # Skip adding assigned_status and completed_status filters - they're in aggregation only
-            pass
-        else:
-            # Conditionally filter for assigned records (assigned_status = 0)
-            # Only apply when query is about completions, assignments, or module interactions
-            should_filter_assigned = self._should_filter_by_assigned_status(entities, user_message)
-            
-            # Remove any assigned_status filters that the LLM might have added incorrectly
-            self._remove_filter_clause(bool_query, "assigned_status")
-            
-            # Add it back only if it should be there
-            if should_filter_assigned:
-                self._append_filter_clause(bool_query, {"term": {"assigned_status": 0}})
-            
-            # Explicitly apply completion filter if entities indicate completion intent
-            # This ensures "did [module]" queries filter for completed_status = 1
-            if entities and entities.get('completion_filter') is not None:
-                completion_status = entities['completion_filter']
-                # Remove any existing completed_status filters first (from both must and filter)
-                self._remove_filter_clause(bool_query, "completed_status")
-                # Add the correct one
-                self._append_filter_clause(bool_query, {"term": {"completed_status": completion_status}})
+        # Bedrock should have already added assigned_status and completed_status filters if needed
+        # based on the query intent. We'll trust Bedrock's judgment here.
 
         filter_clauses = self._build_filter_clauses(context)
         for clause in filter_clauses:
-            # Skip completion_status clauses from context if we already set it from entities
-            # This prevents conflicts between entity detection and context filters
-            if entities and entities.get('completion_filter') is not None:
-                # Check if this clause is a completed_status filter
-                if isinstance(clause, dict) and 'term' in clause:
-                    term_dict = clause.get('term', {})
-                    if isinstance(term_dict, dict) and 'completed_status' in term_dict:
-                        # Skip this clause - we already set it from entities
-                        continue
             self._append_filter_clause(bool_query, clause)
         
         # Convert any term queries for module_name to match_phrase for fuzzy matching
         self._convert_module_name_terms_to_match(bool_query)
         
-        # Smart collapse handling: respect LLM's decision, but override if detection disagrees
-        llm_added_collapse = 'collapse' in query_body
-        should_collapse = entities and entities.get('needs_unique', False)
-        
-        if llm_added_collapse and not should_collapse:
-            # LLM added collapse but our detection says it shouldn't (e.g., "have modules in progress")
-            # Remove it - user wants to see all records, not unique entities
-            del query_body['collapse']
-        elif should_collapse and not llm_added_collapse:
-            # Our detection says it should collapse but LLM didn't add it - add it
-            unique_field = entities.get('unique_field', 'uid')
-            collapse_field = self._get_collapse_field(unique_field)
-            if collapse_field:
-                query_body['collapse'] = {
-                    "field": collapse_field,
-                    "inner_hits": {
-                        "name": "most_recent",
-                        "size": 1,
-                        "sort": [{"created_on": "desc"}]
-                    }
-                }
-        # If both agree (both want collapse or both don't), keep as is
+        # Trust Bedrock's collapse decision - it should follow the rules in the prompt
     
     def _should_filter_by_assigned_status(
         self, 
@@ -1280,22 +1076,7 @@ class QueryOrchestrator:
             'started', 'attempted', 'interaction'
         ]
         
-        # Check entities for completion/assignment intent
-        if entities:
-            # If explicitly asking about completion status
-            if entities.get('completion_filter') is not None:
-                return True
-            # If asking about assignments
-            if entities.get('assigned_status_filter') is not None:
-                return True
-            # If this is a ranking query about completions
-            if entities.get('is_ranking_query') and any(kw in message_lower for kw in completion_keywords):
-                return True
-            # If module intent detected
-            if entities.get('module_intent'):
-                return True
-        
-        # Check message for keywords
+        # Check message for keywords (Bedrock should have already added filters, but we check as fallback)
         has_completion_keyword = any(kw in message_lower for kw in completion_keywords)
         has_assignment_keyword = any(kw in message_lower for kw in assignment_keywords)
         has_module_keyword = any(kw in message_lower for kw in module_interaction_keywords)
@@ -2052,9 +1833,9 @@ class QueryOrchestrator:
                         'bucket_selector': {
                             'buckets_path': {
                                 'assignedCount': 'assigned._count',
-                                'recentCompletedCount': 'recent_completions._count'
+                                'novCount': 'recent_completions._count'  # Changed to match user's example
                             },
-                            'script': 'params.assignedCount > 0 && params.recentCompletedCount == 0'
+                            'script': 'params.assignedCount > 0 && params.novCount == 0'
                         }
                     },
                     'user_info': {
@@ -2191,14 +1972,9 @@ class QueryOrchestrator:
         if not isinstance(aggs, dict):
             return
         
-        threshold = entities.get('count_threshold')
-        operator = entities.get('threshold_operator', 'gt')  # gt = greater than, lt = less than
-        
-        if threshold is None:
-            return
-        
-        # Check if this is about modules (completed modules, finished modules, etc.)
-        user_message = entities.get('original_message', '').lower() if entities.get('original_message') else ''
+        # This method is no longer used - Bedrock handles threshold queries directly
+        # Keeping for backwards compatibility but it won't be called
+        return
         is_module_threshold = any(kw in user_message for kw in ['module', 'modules', 'training', 'course', 'completed', 'finished'])
         
         # First pass: Find and fix any bucket_selectors that reference module_count but module_count is missing
@@ -3346,10 +3122,19 @@ class QueryOrchestrator:
         if config:
             # Add data source info
             aggregations = query_results.get('aggregations', {})
-            for name, value in aggregations.items():
-                if isinstance(value, dict) and 'buckets' in value:
-                    config['data_key'] = name
-                    break
+            if aggregations:
+                # Find the first aggregation with buckets
+                for name, value in aggregations.items():
+                    if isinstance(value, dict) and 'buckets' in value:
+                        config['data_key'] = name
+                        logger.info(f"Found aggregation '{name}' with {len(value.get('buckets', []))} buckets for {response_type.value}")
+                        break
+                else:
+                    # No buckets found - log warning
+                    logger.warning(f"Chart response type {response_type.value} but no aggregations with buckets found!")
+                    logger.warning(f"Aggregations keys: {list(aggregations.keys())}")
+                    for name, value in aggregations.items():
+                        logger.warning(f"  {name}: {type(value).__name__}, keys: {list(value.keys()) if isinstance(value, dict) else 'N/A'}")
         
         return config
     
@@ -3518,6 +3303,211 @@ class QueryOrchestrator:
             'title': 'Available Fields'
         }
     
+    def _is_havent_completed_in_time_query(
+        self,
+        user_message: str,
+        time_period: Optional[TimePeriod]
+    ) -> bool:
+        """
+        Detect if this is a "haven't completed in time range" query.
+        These require special aggregation logic, not simple filters.
+        """
+        if not time_period or time_period.is_lifetime:
+            return False
+        
+        message_lower = user_message.lower()
+        
+        # Pattern keywords
+        havent_patterns = [
+            "haven't completed", "havent completed", "hasn't completed", "hasnt completed",
+            "didn't complete", "didnt complete", "hasn't finished", "hasnt finished",
+            "not completed any", "no completions"
+        ]
+        
+        # Check if message contains haven't completed pattern
+        has_havent = any(pattern in message_lower for pattern in havent_patterns)
+        
+        # Check if it's asking about users/people
+        user_keywords = ["who", "users", "people", "learners", "trainees"]
+        has_user_focus = any(keyword in message_lower for keyword in user_keywords)
+        
+        # Check if it mentions "any module" or similar
+        any_module_patterns = ["any module", "any training", "any course", "a single module"]
+        has_any_module = any(pattern in message_lower for pattern in any_module_patterns)
+        
+        return has_havent and has_user_focus and (has_any_module or "in" in message_lower)
+    
+    def _fix_havent_completed_in_time_query(
+        self,
+        query_payload: Dict[str, Any],
+        time_period: TimePeriod,
+        user_message: str
+    ):
+        """
+        Fix "haven't completed in time range" queries by replacing with correct aggregation pattern.
+        Calls the existing _build_zero_completions_in_range_query method.
+        """
+        logger.info(f"Fixing 'haven't completed' query with aggregation pattern for time range: {time_period.description}")
+        
+        # Use the existing method that builds the correct query structure
+        # Pass empty entities dict since we don't need it anymore
+        self._build_zero_completions_in_range_query(
+            query_payload=query_payload,
+            time_period=time_period,
+            entities={}  # Not needed, but method signature requires it
+        )
+        
+        # Force response type to TABLE so users see the list
+        query_payload['response_type'] = ResponseType.TABLE.value
+        logger.info("Fixed query: replaced with aggregation pattern for zero completions in time range")
+    
+    def _fix_chart_query(
+        self,
+        query_payload: Dict[str, Any],
+        response_type: ResponseType,
+        user_message: str,
+        time_period: Optional[TimePeriod]
+    ):
+        """
+        Fix chart queries that don't have aggregations.
+        Converts hit-based queries (size > 0) to aggregation queries (size: 0 with aggs).
+        """
+        query_body = query_payload.get('query', {})
+        if not isinstance(query_body, dict):
+            return
+        
+        message_lower = user_message.lower()
+        
+        # Detect what to group by from the message
+        group_by_field = None
+        count_field = None
+        
+        if 'module' in message_lower or 'training' in message_lower or 'course' in message_lower:
+            group_by_field = 'module_name'
+            count_field = 'uid'  # Count unique users per module
+        elif 'city' in message_lower or 'cities' in message_lower:
+            group_by_field = 'city'
+            count_field = 'uid'
+        elif 'user' in message_lower or 'learner' in message_lower:
+            group_by_field = 'email_addr'
+            count_field = 'mid'  # Count unique modules per user
+        elif 'skill' in message_lower:
+            group_by_field = 'skill_name'
+            count_field = 'uid'
+        elif 'product' in message_lower:
+            group_by_field = 'product_name'
+            count_field = 'uid'
+        else:
+            # Default: group by module
+            group_by_field = 'module_name'
+            count_field = 'uid'
+        
+        # Extract the base query (filters) from the existing query
+        base_query = query_body.get('query', {})
+        if not base_query:
+            base_query = {"match_all": {}}
+        
+        # Ensure bool query structure
+        if not isinstance(base_query, dict) or 'bool' not in base_query:
+            base_query = {"bool": {"filter": [base_query] if base_query != {"match_all": {}} else []}}
+        
+        # Ensure we have the required filters
+        bool_query = base_query.get('bool', {})
+        filter_clauses = bool_query.get('filter', [])
+        
+        # Add required filters if not present
+        has_user_status = any(
+            isinstance(c, dict) and 'term' in c and isinstance(c.get('term'), dict) and 'user_status' in c.get('term', {})
+            for c in filter_clauses
+        )
+        if not has_user_status:
+            filter_clauses.append({"term": {"user_status": 5}})
+        
+        # Add completion filter if asking about completions
+        if 'complet' in message_lower or 'finish' in message_lower or 'done' in message_lower:
+            has_completed = any(
+                isinstance(c, dict) and 'term' in c and isinstance(c.get('term'), dict) and 'completed_status' in c.get('term', {})
+                for c in filter_clauses
+            )
+            if not has_completed:
+                filter_clauses.append({"term": {"completed_status": 1}})
+            
+            has_assigned = any(
+                isinstance(c, dict) and 'term' in c and isinstance(c.get('term'), dict) and 'assigned_status' in c.get('term', {})
+                for c in filter_clauses
+            )
+            if not has_assigned:
+                filter_clauses.append({"term": {"assigned_status": 0}})
+        
+        # Add time filter if specified
+        if time_period and not time_period.is_lifetime:
+            # Determine time field
+            time_field = 'completed_date' if 'complet' in message_lower else 'created_on'
+            has_time_filter = any(
+                isinstance(c, dict) and 'range' in c and isinstance(c.get('range'), dict) and time_field in c.get('range', {})
+                for c in filter_clauses
+            )
+            if not has_time_filter:
+                filter_clauses.append({
+                    "range": {
+                        time_field: {
+                            "gte": time_period.start_timestamp,
+                            "lt": time_period.end_timestamp
+                        }
+                    }
+                })
+        
+        bool_query['filter'] = filter_clauses
+        base_query['bool'] = bool_query
+        
+        # Determine aggregation name
+        agg_name = 'by_module' if group_by_field == 'module_name' else f'by_{group_by_field}'
+        
+        # Determine order direction
+        order_dir = 'desc' if 'most' in message_lower or 'top' in message_lower or 'best' in message_lower or 'highest' in message_lower else 'asc'
+        
+        # Build the aggregation query
+        query_body['size'] = 0  # Charts need aggregations, not hits
+        query_body['query'] = base_query
+        
+        # For terms aggregation, we can't order by nested aggregation directly
+        # Instead, we'll use bucket_sort or order by _count
+        # For "most" queries, order by doc_count descending
+        if order_dir == 'desc':
+            # Order by doc_count (number of documents in each bucket)
+            query_body['aggs'] = {
+                agg_name: {
+                    "terms": {
+                        "field": group_by_field,
+                        "size": 10,
+                        "order": {"_count": "desc"}
+                    },
+                    "aggs": {
+                        "unique_count": {
+                            "cardinality": {"field": count_field}
+                        }
+                    }
+                }
+            }
+        else:
+            # For ascending, order by _count ascending
+            query_body['aggs'] = {
+                agg_name: {
+                    "terms": {
+                        "field": group_by_field,
+                        "size": 10,
+                        "order": {"_count": "asc"}
+                    },
+                    "aggs": {
+                        "unique_count": {
+                            "cardinality": {"field": count_field}
+                        }
+                    }
+                }
+            }
+        
+        logger.info(f"Fixed chart query: converted to aggregation on {group_by_field}, counting {count_field}, order={order_dir}")
+    
     def _check_for_clarification_needed(
         self,
         entities: Dict[str, Any],
@@ -3530,10 +3520,9 @@ class QueryOrchestrator:
         Returns:
             Clarification question if needed, None otherwise
         """
-        ambiguity_details = entities.get('ambiguity_details', [])
-        
-        if not ambiguity_details:
-            return None
+        # This method is no longer used - Bedrock handles ambiguity detection
+        # Keeping for backwards compatibility but it won't be called
+        return None
         
         # Build clarification question
         questions = []

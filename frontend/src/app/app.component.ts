@@ -278,10 +278,10 @@ interface DisplayMessage {
                       @if (shouldShowQuery(msg)) {
                         <pre class="query-code">{{ getQueryJson(msg) }}</pre>
                       }
-                    } @else if (msg.response?.query_result?.aggregations && !(msg.response?.query_result?.results?.length)) {
+                    } @else if (msg.response?.query_result?.aggregations && (msg.response?.response_type === 'bar_chart' || msg.response?.response_type === 'pie_chart' || msg.response?.response_type === 'line_chart' || !(msg.response?.query_result?.results?.length))) {
                       <!-- Aggregation results with optional chart -->
                       <div class="aggregation-results">
-                        @if (msg.response?.visualization) {
+                        @if (msg.response?.visualization && msg.response?.query_result?.aggregations) {
                           <!-- Chart visualization -->
                           <app-chart-display 
                             [chartData]="getChartData(msg.response?.visualization, msg.response?.query_result?.aggregations)"
@@ -1881,7 +1881,22 @@ export class AppComponent implements OnInit, AfterViewChecked {
         // Filter out empty/blank keys
         const validBuckets = aggData.buckets.filter((b: any) => b.key && String(b.key).trim() !== '');
         labels = validBuckets.map((b: any) => this.formatChartLabel(b.key));
-        data = validBuckets.map((b: any) => b.doc_count);
+        // Extract count value - prefer nested cardinality aggregations over doc_count
+        data = validBuckets.map((b: any) => {
+          // Check for _count field (added by backend for nested cardinality)
+          if (b._count !== undefined) {
+            return b._count;
+          }
+          // Check for nested cardinality aggregations (unique_users, unique_modules, etc.)
+          for (const [nestedKey, nestedValue] of Object.entries(b)) {
+            if (nestedKey === 'key' || nestedKey === 'doc_count' || nestedKey.startsWith('_')) continue;
+            if (nestedValue && typeof nestedValue === 'object' && 'value' in nestedValue) {
+              return nestedValue.value;
+            }
+          }
+          // Fall back to doc_count
+          return b.doc_count || 0;
+        });
         datasetLabel = aggData._label || this.formatAggLabel(name);
         break;
       }

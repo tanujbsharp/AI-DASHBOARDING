@@ -26,6 +26,12 @@ CRITICAL RULES:
 5. Always specify what the numbers represent (e.g., "unique users" vs "records")
 6. Include time context if a date filter was applied
 
+🔴🔴🔴 CRITICAL: For ranking/chart queries (e.g., "which user has completed the most modules"):
+- If you see "count: 0" BUT aggregations exist with buckets, that's NORMAL and EXPECTED!
+- The aggregations contain the ACTUAL ANSWER - use them!
+- NEVER say there's a "hiccup", "problem", or "can't see" when aggregations have data
+- The answer is in the aggregation buckets - extract and state it clearly!
+
 TONE: Friendly, helpful, conversational. Like you're explaining data to a friend, not writing a formal report.
 
 Your response should be a JSON object:
@@ -89,13 +95,27 @@ Generate a response for GROUPED/CHART DATA.
 QUERY RESULTS:
 {query_results}
 
-REQUIREMENTS:
-- Mention total categories found
-- Highlight top performers if relevant
-- Note the grouping dimension
+🔴 CRITICAL: For chart/ranking queries, the data is in AGGREGATIONS, not in the "count" field!
+- If "count" is 0 but aggregations exist, that's NORMAL - the data is in the aggregations!
+- Look at the aggregation buckets to find the top performers
+- The aggregation results show the actual answer to the user's question
 
-EXAMPLE FORMAT:
+REQUIREMENTS:
+- If aggregations exist, use them as the PRIMARY data source
+- ALWAYS mention the top performer(s) by their ACTUAL identifier (email address or name)
+- For "which user" queries, you MUST state the user's email/name - don't just say "a user" or give numbers!
+- Highlight the answer to "which X has most/least" questions directly with the actual identifier
+- Don't say there's a problem if aggregations contain data!
+
+EXAMPLE FORMATS:
+"chandana.v@bsharpcorp.com has completed the most modules with 49 unique modules completed."
+
 "Training completions by city: Bengaluru leads with 456 completions, followed by Mumbai (234) and Chennai (123). Data covers 15 cities total."
+
+"Top 3 users by module completions: chandana.v@bsharpcorp.com (49 modules), user2@example.com (42 modules), user3@example.com (38 modules)."
+
+🔴 CRITICAL: When the aggregation shows an email address (e.g., "chandana.v@bsharpcorp.com: 49"), 
+you MUST include that email in your response! Don't just say "a user" or "the top user" - say the actual email!
 """,
 
         ResponseType.COMPARISON: """
@@ -226,13 +246,21 @@ EXAMPLE FORMAT:
                 fields = [k for k in first.keys() if not k.startswith('_')]
                 parts.append(f"Fields: {', '.join(fields[:10])}")
         
-        # Aggregations (but note: for count threshold queries, use total/count above, not bucket count!)
+        # Aggregations (PRIMARY data source for chart/ranking queries!)
         aggregations = query_results.get('aggregations', {})
         if aggregations:
-            parts.append("\nAggregation Results (for reference only - use 'total' above for count):")
+            # For chart queries, aggregations ARE the primary data, not secondary!
+            is_chart_query = len(results) == 0 and aggregations
+            if is_chart_query:
+                parts.append("\n🔴 PRIMARY DATA - Aggregation Results (this is the main answer!):")
+            else:
+                parts.append("\nAggregation Results:")
             for agg_name, agg_value in aggregations.items():
                 formatted = cls._format_aggregation(agg_name, agg_value)
                 parts.append(f"  {formatted}")
+            if is_chart_query:
+                parts.append("\nNOTE: For chart/ranking queries, use the aggregation data above as the PRIMARY answer.")
+                parts.append("The 'count: 0' above is expected - aggregations contain the actual results!")
         
         return '\n'.join(parts)
     
@@ -251,9 +279,44 @@ EXAMPLE FORMAT:
                 if bucket_count == 0:
                     return f"{name}: 0 categories"
                 
-                # Show top 5 buckets
+                # Show top 5 buckets with better formatting
                 top_buckets = buckets[:5]
-                bucket_strs = [f"{b.get('key', '?')}: {b.get('doc_count', 0):,}" for b in top_buckets]
+                bucket_strs = []
+                for b in top_buckets:
+                    key = b.get('key', '?')
+                    original_key = key  # Keep original for fallback
+                    # Check for nested cardinality (unique_modules, unique_users, etc.)
+                    count = b.get('doc_count', 0)
+                    
+                    # First, get the count from nested aggregations
+                    for nested_key, nested_value in b.items():
+                        if nested_key not in ['key', 'doc_count'] and isinstance(nested_value, dict):
+                            if 'value' in nested_value:
+                                count = nested_value['value']  # Use cardinality value if available
+                                break
+                    
+                    # Then, check for user details in top_hits (check multiple possible names)
+                    user_details_found = False
+                    for top_hits_name in ['user_info', 'user_details', 'top_hits']:
+                        if top_hits_name in b and isinstance(b[top_hits_name], dict):
+                            hits = b[top_hits_name].get('hits', {}).get('hits', [])
+                            if hits and len(hits) > 0:
+                                source = hits[0].get('_source', {})
+                                first_name = source.get('first_name', '')
+                                last_name = source.get('last_name', '')
+                                email = source.get('email_addr', original_key)
+                                if first_name or last_name:
+                                    key = f"{first_name} {last_name}".strip() or email
+                                    user_details_found = True
+                                    break
+                    
+                    # If key is an email and we didn't find user details, keep the email
+                    # This ensures emails are always shown
+                    if '@' in str(key) and not user_details_found:
+                        key = str(key)  # Keep email as-is
+                    
+                    bucket_strs.append(f"{key}: {int(count):,}")
+                
                 result = f"{name}: {bucket_count} categories"
                 if bucket_strs:
                     result += f" (top: {', '.join(bucket_strs)})"
