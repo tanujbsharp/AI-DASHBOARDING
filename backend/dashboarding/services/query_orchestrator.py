@@ -10,6 +10,7 @@ Aligned with usecase.md specification for query building and response handling.
 import copy
 import json
 import logging
+import re
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime
 
@@ -189,7 +190,10 @@ class QueryOrchestrator:
             
             # Clean up unsupported constructs FIRST, before any other processing
             # This prevents errors from propagating through the pipeline
-            self._sanitize_query_payload(query_payload)
+            # Sanitize BEFORE applying structured filters.
+            # Pass time info so date_histogram extended_bounds can always match the requested time window
+            # even if the generated query's time range is missing or hard to extract.
+            self._sanitize_query_payload(query_payload, time_period=effective_time_period, time_field=time_field_override)
             
             # Deduplicate filters to prevent duplicate clauses
             self._deduplicate_filters(query_payload)
@@ -251,7 +255,9 @@ class QueryOrchestrator:
                     self._remove_prohibited_filters_from_top_level(query_body)
             
             # Sanitize again after applying filters (in case filters added unsupported constructs)
-            self._sanitize_query_payload(query_payload)
+            # Sanitize again after applying filters (in case filters added unsupported constructs).
+            # Pass time info again so histograms keep the full requested window.
+            self._sanitize_query_payload(query_payload, time_period=effective_time_period, time_field=time_field_override)
             
             # CRITICAL: Final cleanup for "haven't completed" queries - remove any time filters that might have been added
             # This MUST happen after all filter application to ensure no completed_date filters at top level
@@ -332,6 +338,8 @@ class QueryOrchestrator:
             final_response_type = query_payload.get('response_type', response_type.value)
             if isinstance(final_response_type, ResponseType):
                 final_response_type = final_response_type.value
+            # Normalize common aliases or model-provided variants to our known ResponseType values
+            final_response_type = self._normalize_response_type(final_response_type, fallback=response_type.value)
             
             # Always include the query in response, even if results are empty (0 records)
             # This allows the UI to display the query for debugging/verification
@@ -403,6 +411,45 @@ class QueryOrchestrator:
             # Include query in error response if available
             error_query = query_payload.get('query', {}) if query_payload else None
             return self._error_response(f"An error occurred: {str(e)}", query=error_query)
+
+    def _normalize_response_type(self, value: Any, fallback: str = ResponseType.TABLE.value) -> str:
+        """
+        Normalize response_type strings to known ResponseType enum values.
+        Prevents ValueError crashes when upstream returns aliases like 'time_series'.
+        """
+        if isinstance(value, ResponseType):
+            return value.value
+        if not value:
+            return fallback
+
+        if isinstance(value, str):
+            v = value.strip().lower()
+        else:
+            # Unknown type, return fallback
+            return fallback
+
+        alias_map = {
+            # Common synonyms / legacy values
+            'time_series': ResponseType.LINE_CHART.value,
+            'timeseries': ResponseType.LINE_CHART.value,
+            'trend': ResponseType.LINE_CHART.value,
+            'line': ResponseType.LINE_CHART.value,
+            'bar': ResponseType.BAR_CHART.value,
+            'pie': ResponseType.PIE_CHART.value,
+            'donut': ResponseType.PIE_CHART.value,
+            'doughnut': ResponseType.PIE_CHART.value,
+            'kpi': ResponseType.KPI_WIDGET.value,
+            'kpi_single': ResponseType.KPI_WIDGET.value,
+            'text': ResponseType.TEXT_RESPONSE.value,
+        }
+
+        v = alias_map.get(v, v)
+
+        # Only return values that exist in the enum; otherwise fallback
+        try:
+            return ResponseType(v).value
+        except Exception:
+            return fallback
     
     def _generate_query(
         self,
@@ -1148,11 +1195,12 @@ class QueryOrchestrator:
     ):
         """Add a range clause on the requested time field unless already present."""
         normalized_field = self._normalize_field_for_filter(field_name)
+        end_key = "lte" if getattr(time_period, "end_inclusive", False) else "lt"
         range_clause = {
             "range": {
                 normalized_field: {
                     "gte": time_period.start_timestamp,
-                    "lt": time_period.end_timestamp
+                    end_key: time_period.end_timestamp
                 }
             }
         }
@@ -2265,10 +2313,17 @@ class QueryOrchestrator:
         metadata = execution_result.setdefault('metadata', {})
         metadata['count_threshold_summary'] = True
     
-    def _sanitize_query_payload(self, query_payload: Dict[str, Any]):
+    def _sanitize_query_payload(
+        self,
+        query_payload: Dict[str, Any],
+        time_period: Optional[TimePeriod] = None,
+        time_field: Optional[str] = None
+    ):
         """Remove/convert unsupported query constructs (e.g., terms_lookup)."""
         # Always run recursive removal - it's safe and catches everything
         self._remove_terms_lookup_recursive(query_payload)
+        # Fix date histograms to ensure all days are included
+        self._fix_date_histograms(query_payload, time_period=time_period, time_field=time_field)
     
     def _remove_terms_lookup_recursive(self, obj: Any, parent_key: str = None) -> None:
         """Aggressively remove ALL terms_lookup structures from anywhere in the object."""
@@ -2370,6 +2425,150 @@ class QueryOrchestrator:
                 if self._has_terms_lookup_nested(item):
                     return True
         return False
+    
+    def _fix_date_histograms(
+        self,
+        query_payload: Dict[str, Any],
+        time_period: Optional[TimePeriod] = None,
+        time_field: Optional[str] = None
+    ):
+        """
+        Fix date histogram aggregations to ensure all days are included.
+        Adds min_doc_count: 0 and extended_bounds when time period is detected.
+        """
+        query = query_payload.get('query', {})
+        if not isinstance(query, dict):
+            return
+        
+        # Prefer the explicitly parsed time period (most reliable for "last N days").
+        explicit_start = None
+        explicit_end = None
+        if time_period and not getattr(time_period, "is_lifetime", False):
+            explicit_start = getattr(time_period, "start_timestamp", None)
+            explicit_end = getattr(time_period, "end_timestamp", None)
+
+        # Otherwise, extract time range from query filters if present
+        time_range = None
+        extracted_time_field = None
+        
+        def extract_range_from_query(q: Dict[str, Any]):
+            """Recursively extract time range from query."""
+            if isinstance(q, dict):
+                if 'range' in q:
+                    for field, range_spec in q['range'].items():
+                        if isinstance(range_spec, dict) and ('gte' in range_spec or 'gt' in range_spec):
+                            return field, range_spec
+                for value in q.values():
+                    # IMPORTANT: recurse into *all* list items, not just the first one.
+                    # Previously we only inspected value[0] for lists, which often missed the time range
+                    # because the range clause can appear later in bool.filter arrays.
+                    if isinstance(value, (dict, list)):
+                        result = extract_range_from_query(value)
+                        if result:
+                            return result
+            elif isinstance(q, list):
+                for item in q:
+                    result = extract_range_from_query(item)
+                    if result:
+                        return result
+            return None
+        
+        if explicit_start is None or explicit_end is None:
+            result = extract_range_from_query(query)
+            if result:
+                extracted_time_field, time_range = result
+        
+        # Fix date histograms in aggregations
+        def fix_histogram_recursive(obj: Any):
+            if isinstance(obj, dict):
+                if 'date_histogram' in obj:
+                    date_hist = obj['date_histogram']
+                    if isinstance(date_hist, dict):
+                        # Ensure min_doc_count: 0 to show all days
+                        if 'min_doc_count' not in date_hist:
+                            date_hist['min_doc_count'] = 0
+                        elif date_hist.get('min_doc_count', 0) > 0:
+                            date_hist['min_doc_count'] = 0
+
+                        # Normalize daily histograms to fixed_interval: "1d"
+                        # calendar_interval: "day" can behave differently across DST/timezones and is less predictable.
+                        if date_hist.get('calendar_interval') == 'day':
+                            date_hist.pop('calendar_interval', None)
+                            date_hist['fixed_interval'] = '1d'
+
+                        # If the requested time window spans multiple months, show monthly buckets (not daily).
+                        # This makes "last 2 months" aggregate by month instead of producing 60+ daily points.
+                        try:
+                            if explicit_start is not None and explicit_end is not None:
+                                span_days = (int(explicit_end) - int(explicit_start)) / 86400
+                                if span_days >= 45:
+                                    # Switch to monthly histogram
+                                    date_hist.pop('fixed_interval', None)
+                                    date_hist['calendar_interval'] = 'month'
+                                    # For month buckets, show year-month labels
+                                    date_hist['format'] = 'yyyy-MM'
+                        except Exception:
+                            pass
+                        
+                        # Add/override extended_bounds so OpenSearch returns ALL buckets in the requested time window,
+                        # even when some edge days have 0 activity.
+                        bounds_start = None
+                        bounds_end = None
+
+                        if explicit_start is not None and explicit_end is not None:
+                            bounds_start = explicit_start
+                            bounds_end = explicit_end
+                        elif time_range:
+                            bounds_start = time_range.get('gte') or time_range.get('gt')
+                            bounds_end = time_range.get('lte') or time_range.get('lt')
+
+                        if bounds_start is not None and bounds_end is not None:
+                            # OpenSearch date_histogram returns bucket keys in epoch_millis, and extended_bounds are
+                            # interpreted in that same unit. Even if the field format is epoch_second, supplying
+                            # seconds here will be treated as millis and can explode the bucket range (e.g., 1970→now).
+                            def to_millis(v: Any) -> Any:
+                                try:
+                                    # If it's already millis (>= ~year 5138 in seconds threshold), keep as-is.
+                                    # We use 1e11 as a safe cutover between epoch seconds (~1e10) and millis (~1e13).
+                                    if isinstance(v, (int, float)) and v < 1e11:
+                                        return int(v * 1000)
+                                except Exception:
+                                    pass
+                                return v
+
+                            bounds_start = to_millis(bounds_start)
+                            bounds_end = to_millis(bounds_end)
+                            if 'extended_bounds' not in date_hist:
+                                date_hist['extended_bounds'] = {'min': bounds_start, 'max': bounds_end}
+                            else:
+                                date_hist['extended_bounds']['min'] = bounds_start
+                                date_hist['extended_bounds']['max'] = bounds_end
+                        
+                        # Ensure format is set for readable dates
+                        if 'format' not in date_hist:
+                            date_hist['format'] = 'yyyy-MM-dd'
+                        
+                        # Ensure fixed_interval for daily data
+                        if 'fixed_interval' not in date_hist and 'calendar_interval' not in date_hist:
+                            date_hist['fixed_interval'] = '1d'
+                
+                # Recurse into nested structures
+                for value in obj.values():
+                    fix_histogram_recursive(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    fix_histogram_recursive(item)
+        
+        # Aggregations live inside the OpenSearch query body (query["aggs"]/query["aggregations"]).
+        # Some callers also place them at the envelope level, so we support both.
+        aggs = (
+            (query.get('aggs') if isinstance(query, dict) else None)
+            or (query.get('aggregations') if isinstance(query, dict) else None)
+            or query_payload.get('aggs')
+            or query_payload.get('aggregations')
+        )
+        if aggs:
+            fix_histogram_recursive(aggs)
     
     def _sanitize_terms_lookup(self, node: Any) -> bool:
         """Recursively remove unsupported terms_lookup structures - DEPRECATED, use _remove_terms_lookup_recursive."""
@@ -3029,13 +3228,43 @@ class QueryOrchestrator:
                         if 'module_info' not in bucket:
                             logger.debug(f"Bucket key {bucket.get('key')} does not have 'module_info' aggregation. Available keys: {list(bucket.keys())}")
                     
-                    # SECOND: Extract module_name from sub-aggregation (terms aggregation on module_name)
+                    # SECOND: Extract user name/email from top_hits (for unique users queries)
+                    # Structure: bucket['user_details']['hits']['hits'][0]['_source']['first_name'/'last_name'/'email_addr']
+                    if '_display_name' not in bucket:
+                        for top_hits_name in ['user_details', 'user_info', 'top_hits']:
+                            if top_hits_name in bucket and isinstance(bucket[top_hits_name], dict):
+                                user_info = bucket[top_hits_name]
+                                if 'hits' in user_info and isinstance(user_info['hits'], dict):
+                                    hits = user_info['hits']
+                                    if 'hits' in hits and isinstance(hits['hits'], list) and len(hits['hits']) > 0:
+                                        first_hit = hits['hits'][0]
+                                        if '_source' in first_hit and isinstance(first_hit['_source'], dict):
+                                            source = first_hit['_source']
+                                            first_name = source.get('first_name', '')
+                                            last_name = source.get('last_name', '')
+                                            email = source.get('email_addr', '')
+                                            
+                                            # Prefer name over email, but fall back to email if no name
+                                            if first_name or last_name:
+                                                display_name = f"{first_name} {last_name}".strip()
+                                                bucket['_display_name'] = display_name
+                                                # Also replace key so frontend uses the name
+                                                bucket['key'] = display_name
+                                                logger.info(f"Extracted user name '{display_name}' from {top_hits_name} top_hits, replaced key {bucket.get('_original_key', 'original')} with name")
+                                                break
+                                            elif email:
+                                                bucket['_display_name'] = email
+                                                bucket['key'] = email
+                                                logger.info(f"Extracted user email '{email}' from {top_hits_name} top_hits, replaced key {bucket.get('_original_key', 'original')} with email")
+                                                break
+                    
+                    # THIRD: Extract module_name from sub-aggregation (terms aggregation on module_name)
                     if '_display_name' not in bucket and 'module_name' in bucket and 'buckets' in bucket['module_name']:
                         name_buckets = bucket['module_name']['buckets']
                         if name_buckets:
                             bucket['_display_name'] = name_buckets[0].get('key', bucket.get('key'))
                     
-                    # THIRD: Extract user email/name from sub-aggregation
+                    # FOURTH: Extract user email/name from sub-aggregation (terms aggregation)
                     if '_display_name' not in bucket:
                         if 'user_email' in bucket and 'buckets' in bucket['user_email']:
                             email_buckets = bucket['user_email']['buckets']
@@ -3046,14 +3275,85 @@ class QueryOrchestrator:
                             if name_buckets:
                                 bucket['_display_name'] = name_buckets[0].get('key', bucket.get('key'))
                     
-                    # Extract the count value (unique_users or unique_modules)
-                    # For unique modules queries, use unique_users count (number of completions per module)
-                    if 'unique_users' in bucket:
-                        bucket['_count'] = bucket['unique_users'].get('value', bucket.get('doc_count', 0))
-                    elif 'unique_modules' in bucket:
-                        bucket['_count'] = bucket['unique_modules'].get('value', bucket.get('doc_count', 0))
-                    else:
+                    # FIFTH: Format date histogram timestamps (for time-based charts)
+                    # Date histograms return epoch timestamps as keys - convert to readable dates
+                    # NEVER show epoch timestamps in UI - always format to readable dates
+                    if '_display_name' not in bucket:
+                        key = bucket.get('key')
+                        key_as_string = bucket.get('key_as_string')
+                        
+                        # Check if key is a timestamp (epoch seconds > 1e8 or milliseconds > 1e11)
+                        # This catches timestamps from year 1973 onwards (seconds) or 2001 onwards (milliseconds)
+                        is_timestamp = False
+                        timestamp_seconds = None
+                        
+                        if isinstance(key, (int, float)):
+                            # Check if it's a timestamp in seconds (1e8 to 1e10 range) or milliseconds (1e11+)
+                            if 1e8 <= key <= 1e10:
+                                # Epoch seconds
+                                is_timestamp = True
+                                timestamp_seconds = int(key)
+                            elif key > 1e11:
+                                # Epoch milliseconds
+                                is_timestamp = True
+                                timestamp_seconds = int(key / 1000)
+                        
+                        if is_timestamp:
+                            # It's a timestamp - ALWAYS format it, never show epoch
+                            try:
+                                dt = datetime.utcfromtimestamp(timestamp_seconds)
+                                
+                                # Use key_as_string if available (from date_histogram format), otherwise format ourselves
+                                if key_as_string:
+                                    # key_as_string might be in "yyyy-MM-dd" format, convert to readable
+                                    if re.match(r'^\d{4}-\d{2}-\d{2}$', key_as_string):
+                                        # Parse yyyy-MM-dd and format to readable date
+                                        try:
+                                            date_parts = key_as_string.split('-')
+                                            formatted_date = dt.strftime('%b %d, %Y')
+                                            bucket['_display_name'] = formatted_date
+                                            bucket['key'] = formatted_date
+                                        except:
+                                            bucket['_display_name'] = key_as_string
+                                            bucket['key'] = key_as_string
+                                    else:
+                                        bucket['_display_name'] = key_as_string
+                                        bucket['key'] = key_as_string
+                                else:
+                                    # Format based on likely interval (detect from bucket spacing if possible)
+                                    # Default to readable date format
+                                    formatted_date = dt.strftime('%b %d, %Y')
+                                    bucket['_display_name'] = formatted_date
+                                    bucket['key'] = formatted_date
+                                
+                                logger.debug(f"Formatted timestamp {key} to date: {bucket['_display_name']}")
+                            except (ValueError, OSError) as e:
+                                logger.warning(f"Failed to format timestamp {key}: {e}")
+                                # Even if formatting fails, don't show raw epoch - use a placeholder
+                                bucket['_display_name'] = f"Date {key}"
+                                bucket['key'] = f"Date {key}"
+                        
+                        # If key_as_string exists but we haven't set display_name yet, use it
+                        if '_display_name' not in bucket and key_as_string:
+                            bucket['_display_name'] = key_as_string
+                            bucket['key'] = key_as_string
+                    
+                    # Extract the count value
+                    # For date histograms, ALWAYS use doc_count (actual number of completion records per day)
+                    # For other aggregations, prefer nested cardinality over doc_count
+                    is_date_histogram = 'key_as_string' in bucket or isinstance(bucket.get('key'), (int, float)) and bucket.get('key', 0) > 1e8
+                    
+                    if is_date_histogram:
+                        # Date histogram: use doc_count (actual completions per day)
                         bucket['_count'] = bucket.get('doc_count', 0)
+                    else:
+                        # Other aggregations: prefer nested cardinality
+                        if 'unique_users' in bucket:
+                            bucket['_count'] = bucket['unique_users'].get('value', bucket.get('doc_count', 0))
+                        elif 'unique_modules' in bucket:
+                            bucket['_count'] = bucket['unique_modules'].get('value', bucket.get('doc_count', 0))
+                        else:
+                            bucket['_count'] = bucket.get('doc_count', 0)
                     
                     # If no display name extracted, use the key
                     if '_display_name' not in bucket:
@@ -3079,11 +3379,29 @@ class QueryOrchestrator:
                         'type': 'count'
                     }
                 elif 'buckets' in value:
-                    metrics[name] = {
-                        'label': label,
-                        'value': len(value['buckets']),
-                        'type': 'breakdown'
-                    }
+                    buckets = value['buckets']
+                    # Check if this is a date histogram (has key_as_string or date-like keys)
+                    is_date_histogram = len(buckets) > 0 and (
+                        'key_as_string' in buckets[0] or
+                        (isinstance(buckets[0].get('key'), (int, float)) and buckets[0].get('key', 0) > 1e8) or
+                        (isinstance(buckets[0].get('key'), str) and ('-' in buckets[0].get('key', '') or len(buckets[0].get('key', '')) == 10))
+                    )
+                    
+                    if is_date_histogram:
+                        # For date histograms, sum all doc_count values (total completions)
+                        total_completions = sum(bucket.get('doc_count', 0) for bucket in buckets)
+                        metrics[name] = {
+                            'label': label,
+                            'value': total_completions,
+                            'type': 'count'
+                        }
+                    else:
+                        # For other aggregations, use number of buckets (categories)
+                        metrics[name] = {
+                            'label': label,
+                            'value': len(buckets),
+                            'type': 'breakdown'
+                        }
                 elif 'doc_count' in value:
                     metrics[name] = {
                         'label': label,

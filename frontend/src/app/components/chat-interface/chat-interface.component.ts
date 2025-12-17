@@ -990,31 +990,138 @@ export class ChatInterfaceComponent {
     
     for (const value of Object.values(aggregations)) {
       if (value && typeof value === 'object' && 'buckets' in value && Array.isArray(value.buckets)) {
+        // Check if this is a date histogram (has key_as_string or date-like keys)
+        const isDateHistogram = value.buckets.length > 0 && (
+          'key_as_string' in value.buckets[0] ||
+          (typeof value.buckets[0]?.key === 'number' && value.buckets[0].key > 1e8) ||
+          (typeof value.buckets[0]?.key === 'string' && ('-' in value.buckets[0].key || value.buckets[0].key.length === 10))
+        );
+        
         for (const bucket of value.buckets.slice(0, 15)) { // Limit to 15 for display
-          // Extract count value - prefer nested cardinality aggregations over doc_count
+          // Extract count value
           let count = 0;
-          // Check for _count field (added by backend for nested cardinality)
-          if (bucket._count !== undefined) {
-            count = bucket._count;
+          
+          // For date histograms, ALWAYS use doc_count (actual number of completion records per day)
+          // For other aggregations, prefer nested cardinality over doc_count
+          if (isDateHistogram) {
+            count = bucket.doc_count || 0;
           } else {
-            // Check for nested cardinality aggregations (unique_users, unique_modules, etc.)
-            let foundNested = false;
-            for (const [nestedKey, nestedValue] of Object.entries(bucket)) {
-              if (nestedKey === 'key' || nestedKey === 'doc_count' || nestedKey.startsWith('_')) continue;
-              if (nestedValue && typeof nestedValue === 'object' && 'value' in nestedValue) {
-                count = nestedValue.value;
-                foundNested = true;
-                break;
+            // Check for _count field (added by backend for nested cardinality)
+            if (bucket._count !== undefined) {
+              count = bucket._count;
+            } else {
+              // Check for nested cardinality aggregations (unique_users, unique_modules, etc.)
+              let foundNested = false;
+              for (const [nestedKey, nestedValue] of Object.entries(bucket)) {
+                if (nestedKey === 'key' || nestedKey === 'doc_count' || nestedKey.startsWith('_')) continue;
+                if (nestedValue && typeof nestedValue === 'object' && 'value' in nestedValue) {
+                  const value = (nestedValue as { value: number }).value;
+                  if (typeof value === 'number') {
+                    count = value;
+                    foundNested = true;
+                    break;
+                  }
+                }
+              }
+              // Fall back to doc_count if no nested aggregation found
+              if (!foundNested) {
+                count = bucket.doc_count || 0;
               }
             }
-            // Fall back to doc_count if no nested aggregation found
-            if (!foundNested) {
-              count = bucket.doc_count || 0;
+          }
+          
+          // Format the display key - prefer _display_name, format timestamps, or use key
+          // NEVER show epoch timestamps - always format them
+          let displayKey = bucket._display_name || bucket.key || 'Unknown';
+          
+          // If no _display_name, check if key is a timestamp and format it
+          // Handle both number and string representations
+          if (!bucket._display_name) {
+            let timestampSeconds: number | null = null;
+            let numKey: number | null = null;
+            
+            // Try to parse key as number (handle both number and string)
+            if (typeof bucket.key === 'number') {
+              numKey = bucket.key;
+            } else if (typeof bucket.key === 'string') {
+              // Check if it's a pure numeric string (likely a timestamp)
+              const parsed = Number(bucket.key);
+              if (!isNaN(parsed) && parsed > 0 && /^\d+$/.test(bucket.key.trim())) {
+                numKey = parsed;
+              }
+            }
+            
+            if (numKey !== null) {
+              // Check if it's a timestamp (epoch seconds 1e8-1e10 or milliseconds > 1e11)
+              if (numKey >= 1e8 && numKey <= 1e10) {
+                // Epoch seconds
+                timestampSeconds = numKey;
+              } else if (numKey > 1e11) {
+                // Epoch milliseconds
+                timestampSeconds = numKey / 1000;
+              }
+              
+              if (timestampSeconds !== null) {
+                // It's a timestamp - ALWAYS format it, never show epoch
+                try {
+                  const date = new Date(timestampSeconds * 1000);
+                  // Use key_as_string if available, otherwise format
+                  if (bucket.key_as_string) {
+                    // key_as_string might be in "yyyy-MM-dd" format, convert to readable
+                    const dateStr = bucket.key_as_string;
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+                      // Parse yyyy-MM-dd format
+                      const [year, month, day] = dateStr.split('-').map(Number);
+                      const formattedDate = new Date(year, month - 1, day);
+                      displayKey = formattedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                    } else {
+                      displayKey = bucket.key_as_string;
+                    }
+                  } else {
+                    displayKey = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                  }
+                } catch (e) {
+                  // If formatting fails, don't show raw epoch - use placeholder
+                  displayKey = `Date ${bucket.key}`;
+                }
+              }
+            }
+            
+            // Use key_as_string if available and we haven't set displayKey yet
+            if (displayKey === bucket.key && bucket.key_as_string) {
+              const dateStr = bucket.key_as_string;
+              // Convert yyyy-MM-dd format to readable date
+              if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+                const [year, month, day] = dateStr.split('-').map(Number);
+                const formattedDate = new Date(year, month - 1, day);
+                displayKey = formattedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+              } else {
+                displayKey = bucket.key_as_string;
+              }
+            }
+          }
+          
+          // Final safety check - if displayKey still looks like a timestamp, format it
+          let finalKey = String(displayKey);
+          const finalNum = Number(finalKey);
+          if (!isNaN(finalNum) && finalNum > 0 && /^\d+$/.test(finalKey.trim())) {
+            // Check if it's still a timestamp
+            if ((finalNum >= 1e8 && finalNum <= 1e10) || finalNum > 1e11) {
+              try {
+                let timestampSeconds = finalNum;
+                if (finalNum > 1e11) {
+                  timestampSeconds = finalNum / 1000;
+                }
+                const date = new Date(timestampSeconds * 1000);
+                finalKey = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+              } catch (e) {
+                finalKey = `Date ${finalKey}`;
+              }
             }
           }
           
           buckets.push({
-            key: bucket.key || 'Unknown',
+            key: finalKey,
             count: count
           });
         }

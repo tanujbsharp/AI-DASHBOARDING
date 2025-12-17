@@ -1,0 +1,273 @@
+{
+    "type": "query",
+    "message": "I've analyzed the module completion data for you. Here's what I found: The modules with the most completions are 'how to train your brain to learn any thing effectively' and 'work-life balance', both with 8 completions each. They're followed closely by 'a bias for action', 'code of conduct', 'module | one', and 'quiz module --1', each with 6 completions. It's interesting to see a mix of soft skills and compliance-related modules in the top completions.",
+    "index_id": "module_consumption_data",
+    "query": {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "term": {
+                            "user_status": 5
+                        }
+                    },
+                    {
+                        "term": {
+                            "assigned_status": 0
+                        }
+                    },
+                    {
+                        "term": {
+                            "completed_status": 1
+                        }
+                    },
+                    {
+                        "term": {
+                            "cmid": 1
+                        }
+                    }
+                ],
+                "should": [],
+                "must_not": []
+            }
+        },
+        "aggs": {
+            "by_module": {
+                "terms": {
+                    "field": "module_name",
+                    "size": 10,
+                    "order": {
+                        "unique_users": "desc"
+                    }
+                },
+                "aggs": {
+                    "unique_users": {
+                        "cardinality": {
+                            "field": "uid"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "query_result": {
+        "success": true,
+        "total": 260,
+        "count": 0,
+        "results": [],
+        "took": 827,
+        "aggregations": {
+            "by_module": {
+                "doc_count_error_upper_bound": -1,
+                "sum_other_doc_count": 200,
+                "buckets": [
+                    {
+                        "key": "how to train your brain to learn any thing effectively",
+                        "doc_count": 8,
+                        "unique_users": {
+                            "value": 8
+                        },
+                        "_count": 8,
+                        "_display_name": "how to train your brain to learn any thing effectively"
+                    },
+                    {
+                        "key": "work-life balance",
+                        "doc_count": 8,
+                        "unique_users": {
+                            "value": 8
+                        },
+                        "_count": 8,
+                        "_display_name": "work-life balance"
+                    },
+                    {
+                        "key": "a bias for action",
+                        "doc_count": 6,
+                        "unique_users": {
+                            "value": 6
+                        },
+                        "_count": 6,
+                        "_display_name": "a bias for action"
+                    },
+                    {
+                        "key": "code of conduct",
+                        "doc_count": 6,
+                        "unique_users": {
+                            "value": 6
+                        },
+                        "_count": 6,
+                        "_display_name": "code of conduct"
+                    },
+                    {
+                        "key": "module | one",
+                        "doc_count": 6,
+                        "unique_users": {
+                            "value": 6
+                        },
+                        "_count": 6,
+                        "_display_name": "module | one"
+                    },
+                    {
+                        "key": "quiz module --1",
+                        "doc_count": 6,
+                        "unique_users": {
+                            "value": 6
+                        },
+                        "_count": 6,
+                        "_display_name": "quiz module --1"
+                    },
+                    {
+                        "key": "ai basics - monthly assessment",
+                        "doc_count": 5,
+                        "unique_users": {
+                            "value": 5
+                        },
+                        "_count": 5,
+                        "_display_name": "ai basics - monthly assessment"
+                    },
+                    {
+                        "key": "building high-performance teams",
+                        "doc_count": 5,
+                        "unique_users": {
+                            "value": 5
+                        },
+                        "_count": 5,
+                        "_display_name": "building high-performance teams"
+                    },
+                    {
+                        "key": "compliance basics",
+                        "doc_count": 5,
+                        "unique_users": {
+                            "value": 5
+                        },
+                        "_count": 5,
+                        "_display_name": "compliance basics"
+                    },
+                    {
+                        "key": "it, cybersecurity, confidentiality & awareness - consyst employee training --- 133",
+                        "doc_count": 5,
+                        "unique_users": {
+                            "value": 5
+                        },
+                        "_count": 5,
+                        "_display_name": "it, cybersecurity, confidentiality & awareness - consyst employee training --- 133"
+                    }
+                ],
+                "_label": "By Module"
+            }
+        }
+    },
+    "response_type": "bar_chart",
+    "metrics": {
+        "by_module": {
+            "label": "By Module",
+            "value": 10,
+            "type": "breakdown"
+        }
+    },
+    "visualization": {
+        "type": "bar",
+        "data_key": "by_module"
+    },
+    "time_context": "all time",
+    "title": "Top 10 Modules by Completion Count",
+    "aggregations": {
+        "by_module": {
+            "doc_count_error_upper_bound": -1,
+            "sum_other_doc_count": 200,
+            "buckets": [
+                {
+                    "key": "how to train your brain to learn any thing effectively",
+                    "doc_count": 8,
+                    "unique_users": {
+                        "value": 8
+                    },
+                    "_count": 8,
+                    "_display_name": "how to train your brain to learn any thing effectively"
+                },
+                {
+                    "key": "work-life balance",
+                    "doc_count": 8,
+                    "unique_users": {
+                        "value": 8
+                    },
+                    "_count": 8,
+                    "_display_name": "work-life balance"
+                },
+                {
+                    "key": "a bias for action",
+                    "doc_count": 6,
+                    "unique_users": {
+                        "value": 6
+                    },
+                    "_count": 6,
+                    "_display_name": "a bias for action"
+                },
+                {
+                    "key": "code of conduct",
+                    "doc_count": 6,
+                    "unique_users": {
+                        "value": 6
+                    },
+                    "_count": 6,
+                    "_display_name": "code of conduct"
+                },
+                {
+                    "key": "module | one",
+                    "doc_count": 6,
+                    "unique_users": {
+                        "value": 6
+                    },
+                    "_count": 6,
+                    "_display_name": "module | one"
+                },
+                {
+                    "key": "quiz module --1",
+                    "doc_count": 6,
+                    "unique_users": {
+                        "value": 6
+                    },
+                    "_count": 6,
+                    "_display_name": "quiz module --1"
+                },
+                {
+                    "key": "ai basics - monthly assessment",
+                    "doc_count": 5,
+                    "unique_users": {
+                        "value": 5
+                    },
+                    "_count": 5,
+                    "_display_name": "ai basics - monthly assessment"
+                },
+                {
+                    "key": "building high-performance teams",
+                    "doc_count": 5,
+                    "unique_users": {
+                        "value": 5
+                    },
+                    "_count": 5,
+                    "_display_name": "building high-performance teams"
+                },
+                {
+                    "key": "compliance basics",
+                    "doc_count": 5,
+                    "unique_users": {
+                        "value": 5
+                    },
+                    "_count": 5,
+                    "_display_name": "compliance basics"
+                },
+                {
+                    "key": "it, cybersecurity, confidentiality & awareness - consyst employee training --- 133",
+                    "doc_count": 5,
+                    "unique_users": {
+                        "value": 5
+                    },
+                    "_count": 5,
+                    "_display_name": "it, cybersecurity, confidentiality & awareness - consyst employee training --- 133"
+                }
+            ],
+            "_label": "By Module"
+        }
+    }
+}

@@ -24,16 +24,19 @@ class TimePeriod:
     end_timestamp: int
     description: str
     is_lifetime: bool = False
+    # If true, end_timestamp is inclusive and range queries should use lte instead of lt.
+    end_inclusive: bool = False
     
     def to_range_query(self, field: str = "created_on") -> Dict:
         """Convert to OpenSearch range query."""
         if self.is_lifetime:
             return {}  # No filter for lifetime
+        end_key = "lte" if self.end_inclusive else "lt"
         return {
             "range": {
                 field: {
                     "gte": self.start_timestamp,
-                    "lt": self.end_timestamp
+                    end_key: self.end_timestamp
                 }
             }
         }
@@ -419,13 +422,22 @@ class TimeHandler:
             unit = last_n_match.group(2).rstrip('s')
             
             if unit == 'day':
-                start = now - timedelta(days=n)
+                # Interpret "last N days" as N calendar days ending today (inclusive),
+                # so charts can reliably render exactly N daily buckets.
+                # Example (now = Dec 16): last 30 days => start at Nov 17 00:00 UTC, end at Dec 17 00:00 UTC (exclusive).
+                start = (now - timedelta(days=max(n - 1, 0))).replace(hour=0, minute=0, second=0, microsecond=0)
+                end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             elif unit == 'week':
                 start = now - timedelta(weeks=n)
+                end = now
             elif unit == 'month':
-                # Calculate N months ago
-                month = now.month - n
-                year = now.year
+                # Interpret "last N months" as the previous N FULL calendar months (excluding current partial month).
+                # Example (now = Dec 16): last 2 months => Oct 1 00:00 UTC through Nov 30 23:59:59 UTC.
+                first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                end = first_of_this_month - timedelta(seconds=1)  # end of previous day (inclusive)
+
+                month = first_of_this_month.month - n
+                year = first_of_this_month.year
                 while month <= 0:
                     month += 12
                     year -= 1
@@ -433,14 +445,16 @@ class TimeHandler:
             
             return TimePeriod(
                 start_timestamp=int(start.timestamp()),
-                end_timestamp=int(now.timestamp()),
-                description=f"last {n} {unit}{'s' if n > 1 else ''}"
+                end_timestamp=int(end.timestamp()),
+                description=f"last {n} {unit}{'s' if n > 1 else ''}",
+                end_inclusive=(unit == 'month')
             )
         
         # "last month" (previous calendar month)
         if 'last month' in message:
             first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            end = first_of_this_month
+            # End of last month (inclusive)
+            end = first_of_this_month - timedelta(seconds=1)
             if now.month == 1:
                 start = datetime(now.year - 1, 12, 1, tzinfo=timezone.utc)
             else:
@@ -448,7 +462,8 @@ class TimeHandler:
             return TimePeriod(
                 start_timestamp=int(start.timestamp()),
                 end_timestamp=int(end.timestamp()),
-                description=start.strftime("%B %Y")
+                description=start.strftime("%B %Y"),
+                end_inclusive=True
             )
         
         # "this month" (current calendar month)

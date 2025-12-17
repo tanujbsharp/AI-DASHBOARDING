@@ -2,7 +2,6 @@ from .opensearch_client import OpenSearchClient
 from .bedrock_client import BedrockClient
 from .query_builder import QueryBuilder
 from .time_handler import TimeHandler, TimePeriod
-from .semantic_mapper import SemanticFieldMapper
 from .response_types import ResponseType, ResponseTypeDetector
 from .response_validator import ResponseValidator
 from .conversation_context import (
@@ -18,7 +17,6 @@ __all__ = [
     'QueryBuilder',
     'TimeHandler',
     'TimePeriod',
-    'SemanticFieldMapper',
     'ResponseType',
     'ResponseTypeDetector',
     'ResponseValidator',

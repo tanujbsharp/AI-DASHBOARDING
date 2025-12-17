@@ -1,9 +1,12 @@
-import { Component, OnInit, inject, ViewChild, ElementRef, AfterViewChecked } from '@angular/core';
+import { Component, OnInit, inject, ViewChild, ElementRef, AfterViewChecked, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { RouterLink } from '@angular/router';
 import { ApiService, ChatResponse, ChatMessage as ApiChatMessage, VisualizationConfig, IndexSchema } from './services/api.service';
 import { PromptPlaygroundComponent } from './components/prompt-playground/prompt-playground.component';
 import { ChartDisplayComponent, ChartData, ChartTypeOption } from './components/chart-display/chart-display.component';
+import { AddToDashboardModalComponent } from './components/add-to-dashboard-modal/add-to-dashboard-modal.component';
+import { DashboardItem } from './models/dashboard.models';
 
 interface DisplayMessage {
   id: string;
@@ -17,10 +20,18 @@ interface DisplayMessage {
   isTableLoading?: boolean;
 }
 
+interface DashboardWidgetPayload {
+  type: DashboardItem['type'];
+  title: string;
+  index_id?: string;
+  query_payload: Record<string, any>;
+  render_config: DashboardItem['render_config'];
+}
+
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, FormsModule, PromptPlaygroundComponent, ChartDisplayComponent],
+  imports: [CommonModule, FormsModule, RouterLink, PromptPlaygroundComponent, ChartDisplayComponent, AddToDashboardModalComponent],
   template: `
     <div class="app-container">
       <!-- Header -->
@@ -32,6 +43,14 @@ interface DisplayMessage {
           <span class="logo-text">AI Data Assistant</span>
         </div>
         <div class="header-actions">
+          <button class="builder-btn" routerLink="/dashboards">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+              <line x1="3" y1="9" x2="21" y2="9"/>
+              <line x1="9" y1="21" x2="9" y2="9"/>
+            </svg>
+            My Dashboards
+          </button>
           <button class="builder-btn" [class.active]="showPlayground" (click)="togglePlayground()">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
@@ -259,6 +278,14 @@ interface DisplayMessage {
                 
                 @if (msg.response?.type === 'query' && msg.response?.query_result) {
                   <div class="results-card">
+                    @if (canAddToDashboard(msg)) {
+                      <button class="action-btn icon-only add-to-dashboard-fab" (click)="openAddToDashboard(msg)" title="Add to dashboard">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <line x1="12" y1="5" x2="12" y2="19"/>
+                          <line x1="5" y1="12" x2="19" y2="12"/>
+                        </svg>
+                      </button>
+                    }
                     @if (!(msg.response?.query_result?.results?.length) && !msg.response?.query_result?.aggregations) {
                       <div class="no-results">
                         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -281,11 +308,9 @@ interface DisplayMessage {
                     } @else if (msg.response?.query_result?.aggregations && (msg.response?.response_type === 'bar_chart' || msg.response?.response_type === 'pie_chart' || msg.response?.response_type === 'line_chart' || !(msg.response?.query_result?.results?.length))) {
                       <!-- Aggregation results with optional chart -->
                       <div class="aggregation-results">
-                        @if (msg.response?.visualization && msg.response?.query_result?.aggregations) {
-                          <!-- Chart visualization -->
-                          <app-chart-display 
-                            [chartData]="getChartData(msg.response?.visualization, msg.response?.query_result?.aggregations)"
-                          />
+                        @if (getChartData(msg.response?.visualization, msg.response?.query_result?.aggregations, msg.response?.title); as chartData) {
+                          <!-- Chart visualization (auto-generated when the visualization payload is missing) -->
+                          <app-chart-display [chartData]="chartData" />
                         }
                         
                         <div class="agg-header">
@@ -324,6 +349,14 @@ interface DisplayMessage {
                           </svg>
                           {{ msg.showQuery ? 'Hide' : 'Show' }} Query
                         </button>
+                        @if (canAddToDashboard(msg)) {
+                          <button class="action-btn icon-only add-to-dashboard-inline" (click)="openAddToDashboard(msg)" title="Add to dashboard">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                              <line x1="12" y1="5" x2="12" y2="19"/>
+                              <line x1="5" y1="12" x2="19" y2="12"/>
+                            </svg>
+                          </button>
+                        }
                         @if (shouldShowQuery(msg)) {
                           <pre class="query-code">{{ getQueryJson(msg) }}</pre>
                         }
@@ -442,6 +475,23 @@ interface DisplayMessage {
         </div>
         <p class="input-hint">I'll find the right data source and format the results for you</p>
       </footer>
+
+      @if (showAddToDashboardModal && pendingWidgetData) {
+        <app-add-to-dashboard-modal
+          [widgetData]="pendingWidgetData"
+          (saved)="handleWidgetSaved($event)"
+          (closed)="closeAddToDashboardModal()"
+        />
+      }
+
+      @if (dashboardToast) {
+        <div class="dashboard-toast">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          <span>{{ dashboardToast.message }}</span>
+        </div>
+      }
     </div>
   `,
   styles: [`
@@ -959,6 +1009,7 @@ interface DisplayMessage {
       border: 1px solid var(--border-primary);
       border-radius: var(--radius-lg);
       overflow: hidden;
+      position: relative;
     }
     
     .results-header {
@@ -1138,6 +1189,7 @@ interface DisplayMessage {
       overflow-x: auto;
       max-height: 400px;
       overflow-y: auto;
+      padding-top: var(--spacing-md);
     }
     
     .results-table {
@@ -1204,6 +1256,34 @@ interface DisplayMessage {
     .aggregation-results {
       padding: var(--spacing-lg);
       background: white;
+    }
+
+    .add-to-dashboard-fab {
+      position: absolute;
+      top: var(--spacing-md);
+      right: var(--spacing-md);
+      z-index: 3;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      border: 1px solid rgba(8, 145, 178, 0.2);
+      color: var(--accent-primary);
+      padding: 6px;
+      width: 34px;
+      height: 34px;
+      background: white;
+      box-shadow: 0 4px 14px rgba(8, 145, 178, 0.2);
+
+      svg {
+        pointer-events: none;
+      }
+
+      &:hover {
+        background: var(--accent-primary);
+        color: white;
+        border-color: var(--accent-primary);
+      }
     }
     
     .agg-header {
@@ -1375,9 +1455,37 @@ interface DisplayMessage {
       color: var(--text-tertiary);
       margin-top: var(--spacing-sm);
     }
+
+    .dashboard-toast {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 18px;
+      border-radius: var(--radius-lg);
+      background: rgba(15, 23, 42, 0.95);
+      color: white;
+      box-shadow: 0 15px 35px rgba(15, 23, 42, 0.45);
+      font-weight: 500;
+      z-index: 3000;
+      animation: fadeInUp 0.3s ease;
+    }
+
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
   `]
 })
-export class AppComponent implements OnInit, AfterViewChecked {
+export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
   private api = inject(ApiService);
   @ViewChild('chatContainer') private chatContainer!: ElementRef;
 
@@ -1391,9 +1499,13 @@ export class AppComponent implements OnInit, AfterViewChecked {
   indexLoadError?: string;
   indexSchemas: IndexSchema[] = [];
   private indexColumnCache = new Map<string, string[]>();
+  showAddToDashboardModal = false;
+  pendingWidgetData: DashboardWidgetPayload | null = null;
+  dashboardToast?: { message: string };
 
   private messageId = 0;
   private shouldScroll = false;
+  private toastTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
   ngOnInit() {
     this.checkConnection();
@@ -1403,6 +1515,13 @@ export class AppComponent implements OnInit, AfterViewChecked {
     if (this.shouldScroll) {
       this.scrollToBottom();
       this.shouldScroll = false;
+    }
+  }
+
+  ngOnDestroy() {
+    if (this.toastTimeoutId) {
+      clearTimeout(this.toastTimeoutId);
+      this.toastTimeoutId = null;
     }
   }
 
@@ -1549,15 +1668,18 @@ export class AppComponent implements OnInit, AfterViewChecked {
 
   formatFieldValue(value: any): string {
     if (value === null || value === undefined) return '—';
+    if (typeof value === 'string') {
+      const iso = this.tryFormatIsoDate(value);
+      if (iso) return iso;
+      const epoch = this.tryFormatEpoch(value);
+      if (epoch) return epoch;
+      return value;
+    }
+    const epochFromNumber = this.tryFormatEpoch(value);
+    if (epochFromNumber) return epochFromNumber;
     if (typeof value === 'boolean') return value ? 'Yes' : 'No';
     if (typeof value === 'object') return JSON.stringify(value);
-    if (typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}/)) {
-      try {
-        return new Date(value).toLocaleDateString('en-US', { 
-          year: 'numeric', month: 'short', day: 'numeric' 
-        });
-      } catch { return value; }
-    }
+    if (typeof value === 'number') return String(value);
     return String(value);
   }
 
@@ -1586,6 +1708,53 @@ export class AppComponent implements OnInit, AfterViewChecked {
     }
     
     return keys.slice(0, 8); // Limit to 8 columns for readability
+  }
+
+  private tryFormatIsoDate(value: string): string | null {
+    const trimmed = value?.trim();
+    if (!trimmed || !/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return null;
+    try {
+      return new Date(trimmed).toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric'
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private tryFormatEpoch(value: unknown): string | null {
+    if (typeof value === 'number' && this.isEpochNumber(value)) {
+      return this.formatEpochValue(value);
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (this.isEpochString(trimmed)) {
+        const num = Number(trimmed);
+        if (Number.isFinite(num)) {
+          return this.formatEpochValue(num);
+        }
+      }
+    }
+    return null;
+  }
+
+  private isEpochNumber(value: number): boolean {
+    return Number.isFinite(value) && value >= 1e9 && value <= 1e13;
+  }
+
+  private isEpochString(value: string): boolean {
+    return /^\d{10}$/.test(value) || /^\d{13}$/.test(value);
+  }
+
+  private formatEpochValue(value: number): string {
+    const ms = value < 1e12 ? value * 1000 : value;
+    const date = new Date(ms);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
   }
 
   getIndexTableColumns(schema: IndexSchema): string[] {
@@ -1674,9 +1843,13 @@ export class AppComponent implements OnInit, AfterViewChecked {
           value = this.formatNumber(data.unique_completed.value);
         } else if ('buckets' in data && Array.isArray(data.buckets)) {
           // Show actual bucket values - filter out empty/blank keys
-          const validBuckets = data.buckets.filter((b: any) => b.key && String(b.key).trim() !== '');
+          const validBuckets = data.buckets.filter((b: any) => b.key !== undefined && String(b.key).trim() !== '');
           items = validBuckets.map((b: any) => `${b.key} (${b.doc_count})`);
-          value = validBuckets.length;
+          const bucketTotal = validBuckets.reduce(
+            (sum: number, bucket: any) => sum + (typeof bucket.doc_count === 'number' ? bucket.doc_count : 0),
+            0
+          );
+          value = this.formatNumber(bucketTotal);
         } else if ('doc_count' in data) {
           // Filter aggregation result
           value = this.formatNumber(data.doc_count);
@@ -1802,54 +1975,47 @@ export class AppComponent implements OnInit, AfterViewChecked {
       .trim();
   }
 
-  getChartData(visualization: VisualizationConfig | undefined, aggregations: Record<string, any> | undefined): ChartData | null {
-    if (!visualization || !aggregations) return null;
+  getChartData(
+    visualization: VisualizationConfig | undefined,
+    aggregations: Record<string, any> | undefined,
+    fallbackTitle?: string
+  ): ChartData | null {
+    if (!aggregations) return null;
 
-    // Only process actual chart types - skip KPI widgets, tables, etc.
-    const chartTypes = ['bar', 'pie', 'doughnut', 'line', 'horizontalBar', 'polarArea'];
-    const vizType = visualization.type;
-    
-    // Map comparison to bar chart for display
-    const effectiveType: ChartTypeOption = 
-      vizType === 'comparison' ? 'bar' :
-      chartTypes.includes(vizType) ? vizType as ChartTypeOption : 'bar';
-    
-    // Skip non-chart visualization types
-    if (['kpi_widget', 'multi_kpi', 'table'].includes(vizType)) {
+    // Skip explicitly non-chart visualization hints
+    if (visualization && ['kpi_widget', 'multi_kpi', 'table'].includes(visualization.type)) {
       return null;
     }
+
+    const chartTypes = ['bar', 'pie', 'doughnut', 'line', 'horizontalBar', 'polarArea'];
+    const vizType = visualization?.type;
 
     let labels: string[] = [];
     let data: number[] = [];
     let datasetLabel = 'Count';
+    let inferredFallbackType: ChartTypeOption = 'bar';
 
-    // First, check if this is a comparison (multiple cardinality values)
+    // First, check if this can be represented as a comparison chart
     const comparisonData: { label: string; value: number }[] = [];
     
     for (const [name, aggData] of Object.entries(aggregations)) {
       if (typeof aggData === 'object') {
-        // Check for cardinality value
         if ('value' in aggData && typeof aggData.value === 'number') {
           comparisonData.push({
             label: aggData._label || this.formatAggLabel(name),
             value: Math.round(aggData.value)
           });
-        }
-        // Check for nested filter > cardinality
-        else if ('count' in aggData && typeof aggData.count === 'object' && 'value' in aggData.count) {
+        } else if ('count' in aggData && typeof aggData.count === 'object' && 'value' in aggData.count) {
           comparisonData.push({
             label: aggData._label || this.formatAggLabel(name),
             value: Math.round(aggData.count.value)
           });
-        }
-        else if ('unique_completed' in aggData && typeof aggData.unique_completed === 'object') {
+        } else if ('unique_completed' in aggData && typeof aggData.unique_completed === 'object') {
           comparisonData.push({
             label: aggData._label || this.formatAggLabel(name),
             value: Math.round(aggData.unique_completed.value)
           });
-        }
-        else if ('doc_count' in aggData && !('buckets' in aggData)) {
-          // Filter result with doc_count
+        } else if ('doc_count' in aggData && !('buckets' in aggData)) {
           comparisonData.push({
             label: aggData._label || this.formatAggLabel(name),
             value: aggData.doc_count
@@ -1858,15 +2024,20 @@ export class AppComponent implements OnInit, AfterViewChecked {
       }
     }
 
-    // If we have comparison data (2+ values), use that
     if (comparisonData.length >= 2) {
       labels = comparisonData.map(d => d.label);
       data = comparisonData.map(d => d.value);
       datasetLabel = 'Count';
-      
+
+      const comparisonTitle = visualization?.title || fallbackTitle || 'Comparison';
+      const comparisonType: ChartTypeOption =
+        vizType === 'comparison'
+          ? 'bar'
+          : (vizType && chartTypes.includes(vizType) ? (vizType as ChartTypeOption) : 'bar');
+
       return {
-        type: effectiveType,
-        title: visualization.title || 'Comparison',
+        type: comparisonType,
+        title: comparisonTitle,
         labels,
         datasets: [{
           label: datasetLabel,
@@ -1876,37 +2047,56 @@ export class AppComponent implements OnInit, AfterViewChecked {
     }
 
     // Otherwise, look for bucket aggregations (breakdown by category)
+    let foundBuckets = false;
     for (const [name, aggData] of Object.entries(aggregations)) {
       if (typeof aggData === 'object' && 'buckets' in aggData && Array.isArray(aggData.buckets)) {
-        // Filter out empty/blank keys
         const validBuckets = aggData.buckets.filter((b: any) => b.key && String(b.key).trim() !== '');
+        if (!validBuckets.length) continue;
+
+        const isDateHistogram = (
+          'key_as_string' in validBuckets[0] ||
+          (typeof validBuckets[0]?.key === 'number' && validBuckets[0].key > 1e8) ||
+          (typeof validBuckets[0]?.key === 'string' && ('-' in validBuckets[0].key || validBuckets[0].key.length === 10))
+        );
+
+        inferredFallbackType = isDateHistogram ? 'line' : 'bar';
         labels = validBuckets.map((b: any) => this.formatChartLabel(b.key));
-        // Extract count value - prefer nested cardinality aggregations over doc_count
         data = validBuckets.map((b: any) => {
-          // Check for _count field (added by backend for nested cardinality)
+          if (isDateHistogram) {
+            return b.doc_count || 0;
+          }
           if (b._count !== undefined) {
             return b._count;
           }
-          // Check for nested cardinality aggregations (unique_users, unique_modules, etc.)
           for (const [nestedKey, nestedValue] of Object.entries(b)) {
             if (nestedKey === 'key' || nestedKey === 'doc_count' || nestedKey.startsWith('_')) continue;
             if (nestedValue && typeof nestedValue === 'object' && 'value' in nestedValue) {
-              return nestedValue.value;
+              return (nestedValue as { value: number }).value;
             }
           }
-          // Fall back to doc_count
           return b.doc_count || 0;
         });
+
         datasetLabel = aggData._label || this.formatAggLabel(name);
+        foundBuckets = true;
         break;
       }
     }
 
-    if (labels.length === 0) return null;
+    if (!foundBuckets || labels.length === 0) return null;
+
+    const resolvedType: ChartTypeOption =
+      vizType === 'comparison'
+        ? 'bar'
+        : vizType && chartTypes.includes(vizType)
+          ? vizType as ChartTypeOption
+          : inferredFallbackType;
+
+    const title = visualization?.title || fallbackTitle || 'Chart';
 
     return {
-      type: effectiveType,
-      title: visualization.title || 'Chart',
+      type: resolvedType,
+      title,
       labels,
       datasets: [{
         label: datasetLabel,
@@ -1914,7 +2104,6 @@ export class AppComponent implements OnInit, AfterViewChecked {
       }]
     };
   }
-
   private formatChartLabel(key: any): string {
     // Check if it's a Unix timestamp in milliseconds (13 digits, reasonable date range)
     if (typeof key === 'number' && key > 1000000000000 && key < 2000000000000) {
@@ -2102,5 +2291,114 @@ export class AppComponent implements OnInit, AfterViewChecked {
     try {
       this.chatContainer.nativeElement.scrollTop = this.chatContainer.nativeElement.scrollHeight;
     } catch {}
+  }
+
+  canAddToDashboard(msg: DisplayMessage): boolean {
+    const response = msg.response;
+    if (!response || response.type !== 'query') return false;
+    if (!response.query) return false;
+    if (response.response_type === 'text_response') return false;
+    const hasData = !!(response.query_result?.results?.length || response.query_result?.aggregations);
+    return hasData;
+  }
+
+  openAddToDashboard(msg: DisplayMessage) {
+    const response = msg.response;
+    if (!response?.query) return;
+
+    this.pendingWidgetData = {
+      type: this.resolveDashboardType(response),
+      title: this.buildWidgetTitle(msg),
+      index_id: response.index_id,
+      query_payload: response.query,
+      render_config: this.buildRenderConfig(response),
+    };
+    this.showAddToDashboardModal = true;
+  }
+
+  closeAddToDashboardModal() {
+    this.showAddToDashboardModal = false;
+    this.pendingWidgetData = null;
+  }
+
+  handleWidgetSaved(item: DashboardItem) {
+    this.closeAddToDashboardModal();
+    this.showToast(`Added "${item.title}" to My Dashboards`);
+  }
+
+  private buildWidgetTitle(msg: DisplayMessage): string {
+    return (
+      msg.response?.title?.trim() ||
+      msg.response?.visualization?.title?.trim() ||
+      msg.content?.trim() ||
+      'Dashboard Widget'
+    );
+  }
+
+  private buildRenderConfig(response: ChatResponse): DashboardItem['render_config'] {
+    const config: DashboardItem['render_config'] = {
+      response_type: response.response_type,
+    };
+
+    if (response.fields_to_show?.length) {
+      config.fields_to_show = response.fields_to_show;
+    }
+
+    if (response.visualization) {
+      config.visualization = { ...response.visualization };
+    }
+
+    if (response.metrics) {
+      config.metrics = response.metrics;
+    }
+
+    return config;
+  }
+
+  private resolveDashboardType(response: ChatResponse): DashboardItem['type'] {
+    switch (response.response_type) {
+      case 'bar_chart':
+        return 'bar_chart';
+      case 'line_chart':
+        return 'line_chart';
+      case 'pie_chart':
+        return 'pie_chart';
+      case 'kpi_widget':
+        return 'kpi_widget';
+      case 'multi_kpi':
+        return 'multi_kpi';
+      case 'comparison':
+        return 'comparison';
+      case 'table':
+        return 'table';
+    }
+
+    const vizType = response.visualization?.type;
+    if (vizType) {
+      if (vizType === 'pie' || vizType === 'doughnut') return 'pie_chart';
+      if (vizType === 'line') return 'line_chart';
+      return 'bar_chart';
+    }
+
+    if (response.query_result?.results?.length) {
+      return 'table';
+    }
+
+    if (response.query_result?.aggregations) {
+      return 'bar_chart';
+    }
+
+    return 'table';
+  }
+
+  private showToast(message: string) {
+    this.dashboardToast = { message };
+    if (this.toastTimeoutId) {
+      clearTimeout(this.toastTimeoutId);
+    }
+    this.toastTimeoutId = setTimeout(() => {
+      this.dashboardToast = undefined;
+      this.toastTimeoutId = null;
+    }, 3200);
   }
 }

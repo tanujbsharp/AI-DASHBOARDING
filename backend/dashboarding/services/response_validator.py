@@ -86,29 +86,83 @@ class ResponseValidator:
     
     @classmethod
     def _extract_numbers(cls, text: str) -> List[int]:
-        """Extract all numbers from text, handling comma-formatted numbers."""
+        """
+        Extract all numbers from text, handling comma-formatted numbers.
+        
+        CRITICAL: Exclude numbers that are:
+        - Query parameters (top N, show N, first N, etc.)
+        - Date components (day numbers in dates like "Nov 22")
+        - Time periods (last N days, etc.)
+        - Years
+        - Small ordinals/conversational numbers
+        """
         # Match numbers with optional commas (e.g., 1,234,567)
         pattern = r'\b(\d{1,3}(?:,\d{3})*|\d+)\b'
         matches = re.findall(pattern, text)
         
         numbers = []
+        text_lower = text.lower()
+        
         for match in matches:
             # Remove commas and convert to int
             try:
                 num = int(match.replace(',', ''))
+                
                 # Filter out likely non-data numbers:
-                # - Years (1900-2100) - these are likely years, not data
-                # - Small numbers (1-10) - these are likely ordinals, conversational, or not meaningful data
-                # Only include numbers that are likely to be actual data:
-                # - Numbers > 10 (unless they're years)
-                # - Years outside normal range (< 1900 or > 2100)
+                
+                # 1. Years (1900-2100) - these are likely years, not data
                 if 1900 <= num <= 2100:
-                    # This is likely a year, skip it
                     continue
-                elif num > 10:
-                    # This is likely data (count, ID, etc.)
-                    numbers.append(num)
-                # else: num is 1-10, skip it (likely ordinal or conversational)
+                
+                # 2. Time period numbers (e.g., "last 30 days", "past 7 days", "next 5 weeks")
+                time_patterns = [
+                    rf'\blast\s+{num}\s+(days?|weeks?|months?|years?)\b',
+                    rf'\bpast\s+{num}\s+(days?|weeks?|months?|years?)\b',
+                    rf'\bnext\s+{num}\s+(days?|weeks?|months?|years?)\b',
+                    rf'\b{num}\s+(days?|weeks?|months?|years?)\s+ago\b',
+                    rf'\b{num}\s+(days?|weeks?|months?|years?)\s+back\b',
+                ]
+                if any(re.search(pattern, text_lower) for pattern in time_patterns):
+                    continue
+                
+                # 3. Query parameter numbers (top N, show N, first N, etc.)
+                query_param_patterns = [
+                    rf'\btop\s+{num}\b',
+                    rf'\bfirst\s+{num}\b',
+                    rf'\bshow\s+{num}\b',
+                    rf'\bdisplay\s+{num}\b',
+                    rf'\blist\s+{num}\b',
+                    rf'\bget\s+{num}\b',
+                    rf'\bfetch\s+{num}\b',
+                    rf'\b{num}\s+results?\b',
+                    rf'\b{num}\s+items?\b',
+                    rf'\b{num}\s+records?\b',
+                    rf'\b{num}\s+users?\b',
+                    rf'\b{num}\s+modules?\b',
+                ]
+                if any(re.search(pattern, text_lower) for pattern in query_param_patterns):
+                    continue
+                
+                # 4. Date components - day numbers in dates (e.g., "Nov 22, 2025", "22nd", "22/12/2025")
+                # Check if number appears near month names or date patterns
+                date_patterns = [
+                    rf'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+{num}\b',
+                    rf'\b{num}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b',
+                    rf'\b{num}(?:st|nd|rd|th)?\s*[,/]\s*\d{{1,2}}',  # "22, 2025" or "22/12"
+                    rf'\b{num}(?:st|nd|rd|th)?\s*[,/]\s*\d{{4}}',  # "22, 2025" or "22/2025"
+                    rf'\b\d{{1,2}}[/-]{num}[/-]\d{{2,4}}',  # "12/22/2025" or "12-22-2025"
+                ]
+                if any(re.search(pattern, text_lower) for pattern in date_patterns):
+                    continue
+                
+                # 5. Small numbers (1-31) that could be dates, ordinals, or query parameters
+                # Only validate numbers > 31 as they're more likely to be actual data values
+                if num <= 31:
+                    continue
+                
+                # Only include numbers that are likely to be actual data:
+                # - Numbers > 31 (unless they're years, time periods, query params, or dates)
+                numbers.append(num)
             except ValueError:
                 continue
         
