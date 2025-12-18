@@ -2056,7 +2056,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
         const isDateHistogram = (
           'key_as_string' in validBuckets[0] ||
           (typeof validBuckets[0]?.key === 'number' && validBuckets[0].key > 1e8) ||
-          (typeof validBuckets[0]?.key === 'string' && ('-' in validBuckets[0].key || validBuckets[0].key.length === 10))
+          (typeof validBuckets[0]?.key === 'string' && (validBuckets[0].key.includes('-') || validBuckets[0].key.length === 10))
         );
 
         inferredFallbackType = isDateHistogram ? 'line' : 'bar';

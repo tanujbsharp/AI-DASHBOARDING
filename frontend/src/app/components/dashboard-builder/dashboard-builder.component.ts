@@ -92,6 +92,15 @@ type Layout = { x: number; y: number; cols: number; rows: number };
                     <div class="widget-title">{{ widget.item.title }}</div>
                   </div>
                   <div class="widget-actions">
+                    @if (canExportWidget(widget)) {
+                      <button class="icon-btn" (click)="exportWidget(widget)" [disabled]="widget.isLoading" title="Download">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                          <polyline points="7 10 12 15 17 10"/>
+                          <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                      </button>
+                    }
                     <button class="icon-btn" (click)="refreshWidget(widget)" [disabled]="widget.isLoading" title="Refresh">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polyline points="23 4 23 10 17 10"/>
@@ -306,8 +315,18 @@ type Layout = { x: number; y: number; cols: number; rows: number };
     .empty-state p { font-size: 1.125rem; font-weight: 600; color: var(--text-secondary, #6b7280); margin-bottom: var(--spacing-xs, 8px); }
     .empty-state .hint { font-size: 0.875rem; color: var(--text-tertiary, #9ca3af); margin-bottom: var(--spacing-lg, 20px); }
 
-    .dashboard-grid { flex: 1; padding: 16px; overflow-y: auto; background: var(--bg-primary, #f9fafb); }
-    :host ::ng-deep gridster { background: transparent; }
+    .dashboard-grid { 
+      flex: 1; 
+      min-height: 0; 
+      padding: 16px; 
+      overflow-y: auto; 
+      overflow-x: hidden;
+      background: var(--bg-primary, #f9fafb); 
+    }
+    :host ::ng-deep gridster { 
+      background: transparent; 
+      height: 100%;
+    }
 
     :host ::ng-deep gridster-item { border-radius: var(--radius-md, 8px); overflow: visible !important; }
     :host ::ng-deep .gridster-item-moving { z-index: 1000; }
@@ -1006,6 +1025,175 @@ export class DashboardBuilderComponent implements OnInit, OnDestroy {
       month: 'short',
       day: 'numeric'
     });
+  }
+
+  canExportWidget(widget: WidgetData): boolean {
+    if (!widget.queryResult) return false;
+    
+    // Tables can be exported if they have results
+    if (widget.item.type === 'table') {
+      return !!(widget.queryResult.results?.length || widget.queryResult.aggregations);
+    }
+    
+    // Charts can be exported if they have aggregations
+    if (['bar_chart', 'pie_chart', 'line_chart'].includes(widget.item.type)) {
+      return !!widget.queryResult.aggregations;
+    }
+    
+    // KPIs can be exported if they have aggregations
+    if (['kpi_widget', 'multi_kpi', 'comparison'].includes(widget.item.type)) {
+      return !!widget.queryResult.aggregations;
+    }
+    
+    return false;
+  }
+
+  exportWidget(widget: WidgetData) {
+    if (!widget.queryResult) return;
+    
+    const widgetTitle = (widget.item.title || 'widget').replace(/[^a-z0-9]/gi, '_');
+    const timestamp = Date.now();
+    
+    // Export table data
+    if (widget.item.type === 'table') {
+      if (widget.queryResult.results?.length) {
+        const results = widget.queryResult.results;
+        const fields = widget.item.render_config?.fields_to_show;
+        this.exportTableData(results, fields, `${widgetTitle}_${timestamp}.csv`);
+        return;
+      }
+      // If table has aggregations but no results, export as aggregation data
+      if (widget.queryResult.aggregations) {
+        this.exportAggregationData(
+          widget.queryResult.aggregations,
+          'table',
+          widget.item.render_config?.metrics,
+          `${widgetTitle}_${timestamp}.csv`
+        );
+        return;
+      }
+    }
+    
+    // Export aggregation data (for charts and KPIs)
+    if (widget.queryResult.aggregations) {
+      this.exportAggregationData(
+        widget.queryResult.aggregations,
+        widget.item.type,
+        widget.item.render_config?.metrics,
+        `${widgetTitle}_${timestamp}.csv`
+      );
+      return;
+    }
+  }
+
+  private exportTableData(results: Record<string, any>[], fields?: string[], filename?: string) {
+    if (!results?.length) return;
+    
+    const keys = fields?.length 
+      ? fields 
+      : Object.keys(results[0]).filter(k => !k.startsWith('_'));
+    
+    const rows = results.map((row, index) => 
+      [index + 1, ...keys.map(k => {
+        const v = row[k];
+        if (v === null || v === undefined) return '';
+        // Format epoch dates
+        const formatted = this.formatFieldValue(v);
+        if (typeof formatted === 'string' && formatted.includes(',')) return `"${formatted}"`;
+        return String(formatted);
+      })].join(',')
+    );
+    
+    const csv = [['#', ...keys].join(','), ...rows].join('\n');
+    this.downloadCsv(csv, filename || `table_export_${Date.now()}.csv`);
+  }
+
+  private exportAggregationData(
+    aggregations: Record<string, any>,
+    widgetType: string,
+    metrics?: Record<string, { label: string; description: string }>,
+    filename?: string
+  ) {
+    const rows: string[] = [];
+    
+    // For KPI widgets, export as key-value pairs
+    if (['kpi_widget', 'multi_kpi', 'comparison'].includes(widgetType)) {
+      const kpis = this.extractKPIs(aggregations, metrics);
+      rows.push('Metric,Value,Description');
+      for (const kpi of kpis) {
+        const valueStr = String(kpi.value);
+        const value = valueStr.includes(',') ? `"${valueStr}"` : valueStr;
+        const desc = (kpi.description || '').replace(/,/g, ';');
+        rows.push(`${kpi.label},${value},${desc}`);
+      }
+    } else {
+      // For charts, export bucket data
+      rows.push('Category,Value,Count');
+      for (const [aggName, aggData] of Object.entries(aggregations)) {
+        if (typeof aggData === 'object' && Array.isArray(aggData.buckets)) {
+          for (const bucket of aggData.buckets) {
+            const key = bucket.key || bucket.key_as_string || '';
+            const count = bucket.doc_count || bucket._count || 0;
+            const value = bucket.value || count;
+            const category = String(key).replace(/,/g, ';');
+            rows.push(`${category},${value},${count}`);
+          }
+        } else if (typeof aggData === 'object' && 'value' in aggData) {
+          const label = aggData._label || this.formatAggLabel(aggName);
+          const value = aggData.value || 0;
+          rows.push(`${label},${value},${value}`);
+        }
+      }
+    }
+    
+    const csv = rows.join('\n');
+    this.downloadCsv(csv, filename || `widget_export_${Date.now()}.csv`);
+  }
+
+  private downloadCsv(csv: string, filename: string) {
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  private formatAggLabel(name: string): string {
+    const labelMap: Record<string, string> = {
+      'unique_users': 'Unique Users',
+      'unique_emails': 'Unique Users',
+      'total_users': 'Total Users',
+      'users_completed': 'Users Completed',
+      'unique_modules': 'Unique Modules',
+      'unique_modules_published': 'Modules Published',
+      'unique_modules_consumed': 'Modules Consumed',
+      'total_modules': 'Total Modules',
+      'modules_completed': 'Modules Completed',
+      'completed_modules': 'Completed Modules',
+      'main_metric': 'Main Metric',
+      'metric_1': 'Metric 1',
+      'metric_2': 'Metric 2',
+      'by_module': 'By Module',
+      'by_city': 'By City',
+      'by_country': 'By Country',
+      'modules_breakdown': 'Module Breakdown',
+      'completions_by_module': 'Completions by Module',
+      'completions_by_city': 'Completions by City',
+      'completed': 'Completed',
+      'completed_only': 'Completed',
+      'not_completed': 'Not Completed',
+    };
+    
+    const lower = name.toLowerCase();
+    if (labelMap[lower]) return labelMap[lower];
+    
+    return name
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase())
+      .replace('Unique ', '')
+      .trim();
   }
 
   ngOnDestroy() {

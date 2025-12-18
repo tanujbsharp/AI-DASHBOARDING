@@ -138,18 +138,36 @@ EXAMPLE FORMAT:
 """,
 
         ResponseType.LINE_CHART: """
-Generate a response for TREND DATA.
+Generate a response for TREND DATA (time series / daily completions).
 
 QUERY RESULTS:
 {query_results}
 
-REQUIREMENTS:
-- Describe the overall trend (increasing, decreasing, stable)
-- Highlight notable peaks or dips
-- Mention the time range covered
+🔴🔴🔴 CRITICAL FOR DATE HISTOGRAM / DAILY DATA:
+- The data is in AGGREGATION BUCKETS, NOT in the "count" or "total" fields!
+- You MUST check the aggregation buckets to see which days have activity
+- If buckets show non-zero doc_count or counts, there IS activity - don't say there isn't!
+- **FOR DATE HISTOGRAMS: ALWAYS use doc_count (NOT nested cardinality like unique_users/unique_modules)**
+- **doc_count = actual number of completion records per day**
+- **Nested cardinality (unique_users, unique_modules) counts unique entities, NOT total completions**
+- Look at EACH bucket's doc_count to find days with completions
+- If you see buckets with doc_count > 0, there ARE completions - state them clearly!
+- NEVER say "no completions" or "zero completions" if any bucket has doc_count > 0
 
-EXAMPLE FORMAT:
+REQUIREMENTS:
+- Check ALL aggregation buckets for activity (doc_count > 0)
+- List the specific days/dates that have completions (from bucket keys)
+- State the count for each day with activity using doc_count
+- Describe the overall pattern (sparse activity, concentrated activity, etc.)
+- Mention the time range covered
+- If most days are zero but some have activity, say "activity is concentrated on [dates]"
+
+EXAMPLE FORMATS:
+"Daily completions for the last 30 days show activity on 8 days: Nov 22 (1), Dec 1 (1), Dec 2 (1), Dec 3 (2), Dec 4 (1), Dec 5 (1), and Dec 15 (1). Most days had zero completions, with the highest activity on Dec 3 with 2 completions."
+
 "Training completions show an upward trend over the last 6 months, from 123 in June to 456 in November (270% increase). Peak month was October with 489 completions."
+
+🔴 CRITICAL: If aggregation buckets exist and show any non-zero counts, you MUST mention those specific days/dates with activity!
 """,
 
         ResponseType.PIE_CHART: """
@@ -272,55 +290,91 @@ EXAMPLE FORMAT:
             if 'value' in value:
                 return f"{name}: {int(value['value']):,}"
             
-            # Terms aggregation (buckets)
+            # Terms aggregation (buckets) or Date histogram (buckets)
             if 'buckets' in value:
                 buckets = value['buckets']
                 bucket_count = len(buckets)
                 if bucket_count == 0:
                     return f"{name}: 0 categories"
                 
-                # Show top 5 buckets with better formatting
-                top_buckets = buckets[:5]
-                bucket_strs = []
-                for b in top_buckets:
-                    key = b.get('key', '?')
-                    original_key = key  # Keep original for fallback
-                    # Check for nested cardinality (unique_modules, unique_users, etc.)
-                    count = b.get('doc_count', 0)
-                    
-                    # First, get the count from nested aggregations
-                    for nested_key, nested_value in b.items():
-                        if nested_key not in ['key', 'doc_count'] and isinstance(nested_value, dict):
-                            if 'value' in nested_value:
-                                count = nested_value['value']  # Use cardinality value if available
-                                break
-                    
-                    # Then, check for user details in top_hits (check multiple possible names)
-                    user_details_found = False
-                    for top_hits_name in ['user_info', 'user_details', 'top_hits']:
-                        if top_hits_name in b and isinstance(b[top_hits_name], dict):
-                            hits = b[top_hits_name].get('hits', {}).get('hits', [])
-                            if hits and len(hits) > 0:
-                                source = hits[0].get('_source', {})
-                                first_name = source.get('first_name', '')
-                                last_name = source.get('last_name', '')
-                                email = source.get('email_addr', original_key)
-                                if first_name or last_name:
-                                    key = f"{first_name} {last_name}".strip() or email
-                                    user_details_found = True
-                                    break
-                    
-                    # If key is an email and we didn't find user details, keep the email
-                    # This ensures emails are always shown
-                    if '@' in str(key) and not user_details_found:
-                        key = str(key)  # Keep email as-is
-                    
-                    bucket_strs.append(f"{key}: {int(count):,}")
+                # Check if this is a date histogram (has key_as_string or date-like keys)
+                is_date_histogram = any(
+                    'key_as_string' in b or 
+                    (isinstance(b.get('key'), (int, float)) and b.get('key', 0) > 1e8) or
+                    (isinstance(b.get('key'), str) and ('-' in str(b.get('key', '')) or len(str(b.get('key', ''))) == 10))
+                    for b in buckets[:3]  # Check first few buckets
+                )
                 
-                result = f"{name}: {bucket_count} categories"
-                if bucket_strs:
-                    result += f" (top: {', '.join(bucket_strs)})"
-                return result
+                # For date histograms, show ALL buckets with activity (non-zero counts)
+                # For other aggregations, show top 5
+                if is_date_histogram:
+                    # Show all buckets with activity (doc_count > 0)
+                    active_buckets = [b for b in buckets if b.get('doc_count', 0) > 0]
+                    if not active_buckets:
+                        # All buckets are zero, but show a few to indicate the range
+                        active_buckets = buckets[:3]
+                    
+                    bucket_strs = []
+                    for b in active_buckets:
+                        # Use key_as_string if available (readable date), otherwise use key
+                        key = b.get('key_as_string') or b.get('_display_name') or b.get('key', '?')
+                        
+                        # For date histograms, ALWAYS use doc_count (actual number of completion records per day)
+                        # DO NOT use nested cardinality aggregations for date histograms
+                        count = b.get('doc_count', 0)
+                        
+                        if count > 0:
+                            bucket_strs.append(f"{key} ({int(count)})")
+                    
+                    result = f"{name}: {bucket_count} days total"
+                    if bucket_strs:
+                        result += f" - Activity on: {', '.join(bucket_strs)}"
+                    else:
+                        result += " - No activity (all days show 0 completions)"
+                    return result
+                else:
+                    # Regular terms aggregation - show top 5 buckets
+                    top_buckets = buckets[:5]
+                    bucket_strs = []
+                    for b in top_buckets:
+                        key = b.get('key', '?')
+                        original_key = key  # Keep original for fallback
+                        # Check for nested cardinality (unique_modules, unique_users, etc.)
+                        count = b.get('doc_count', 0)
+                        
+                        # First, get the count from nested aggregations
+                        for nested_key, nested_value in b.items():
+                            if nested_key not in ['key', 'doc_count'] and isinstance(nested_value, dict):
+                                if 'value' in nested_value:
+                                    count = nested_value['value']  # Use cardinality value if available
+                                    break
+                        
+                        # Then, check for user details in top_hits (check multiple possible names)
+                        user_details_found = False
+                        for top_hits_name in ['user_info', 'user_details', 'top_hits']:
+                            if top_hits_name in b and isinstance(b[top_hits_name], dict):
+                                hits = b[top_hits_name].get('hits', {}).get('hits', [])
+                                if hits and len(hits) > 0:
+                                    source = hits[0].get('_source', {})
+                                    first_name = source.get('first_name', '')
+                                    last_name = source.get('last_name', '')
+                                    email = source.get('email_addr', original_key)
+                                    if first_name or last_name:
+                                        key = f"{first_name} {last_name}".strip() or email
+                                        user_details_found = True
+                                        break
+                        
+                        # If key is an email and we didn't find user details, keep the email
+                        # This ensures emails are always shown
+                        if '@' in str(key) and not user_details_found:
+                            key = str(key)  # Keep email as-is
+                        
+                        bucket_strs.append(f"{key}: {int(count):,}")
+                    
+                    result = f"{name}: {bucket_count} categories"
+                    if bucket_strs:
+                        result += f" (top: {', '.join(bucket_strs)})"
+                    return result
             
             # Nested filter aggregation
             if 'doc_count' in value:

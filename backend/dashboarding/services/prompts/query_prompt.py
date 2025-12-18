@@ -71,13 +71,18 @@ CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
    {
      "aggs": {
        "by_module": {
-         "terms": {"field": "module_name", "size": 10, "order": {"unique_users": "desc"}},
+         "terms": {"field": "module_name", "size": 10, "order": {"_count": "desc"}},
          "aggs": {
            "unique_users": {"cardinality": {"field": "uid"}}
          }
        }
      }
    }
+   
+   🔴 CRITICAL ORDERING RULES:
+   - "most completed" / "most completions" → order by "_count": "desc" (total completion records)
+   - "most unique users" / "most learners" → order by "unique_users": "desc" (cardinality)
+   - For "most completed modules", use _count (doc_count), NOT unique_users!
    
    Example - Top users by completions (GROUP BY EMAIL):
    {
@@ -742,7 +747,7 @@ Query pattern for "which module has most completions" OR "graph of most complete
       "terms": {{ 
         "field": "module_name", 
         "size": 10, 
-        "order": {{"unique_users": "desc"}} 
+        "order": {{"_count": "desc"}} 
       }},
       "aggs": {{
         "unique_users": {{ 
@@ -752,6 +757,13 @@ Query pattern for "which module has most completions" OR "graph of most complete
     }}
   }}
 }}
+
+🔴 CRITICAL: For "most completed" queries, ALWAYS use "order": {{"_count": "desc"}} 
+  - "_count" = total completion records (doc_count) = what "most completed" means
+  - "unique_users" = distinct users who completed = different metric!
+  - Example: Module A has 100 completions from 10 users → _count=100, unique_users=10
+  - Example: Module B has 50 completions from 50 users → _count=50, unique_users=50
+  - For "most completed", Module A wins (100 > 50), even though Module B has more unique users
 
 🔴 CRITICAL FOR CHARTS:
 - ALWAYS use size: 0 when user asks for a "graph" or "chart"
@@ -936,14 +948,37 @@ Query pattern:
     "over_time": {{
       "date_histogram": {{
         "field": "created_on",
-        "calendar_interval": "month"
+        "fixed_interval": "1d",
+        "format": "yyyy-MM-dd",
+        "keyed": false
       }},
       "aggs": {{
         "unique_users": {{ "cardinality": {{ "field": "uid" }} }}
       }}
     }}
   }}
-}}""",
+}}
+
+🔴 CRITICAL DATE_HISTOGRAM RULES:
+  - For daily data: Use "fixed_interval": "1d" (NOT "calendar_interval")
+  - ALWAYS include "format": "yyyy-MM-dd" to get readable dates in key_as_string
+  - ALWAYS include "min_doc_count": 0 to show ALL days, even with 0 completions
+  - For monthly data: Use "calendar_interval": "month" with "format": "yyyy-MM"
+  - NEVER use size limit on date_histogram - it will limit the number of buckets!
+  - For "last N days" queries, ensure the date range covers all N days AND include min_doc_count: 0
+  - Example for "last 30 days":
+    {{
+      "date_histogram": {{
+        "field": "completed_date",
+        "fixed_interval": "1d",
+        "format": "yyyy-MM-dd",
+        "min_doc_count": 0,
+        "extended_bounds": {{
+          "min": START_TIMESTAMP,
+          "max": END_TIMESTAMP
+        }}
+      }}
+    }}""",
 
         ResponseType.PIE_CHART: """
 RESPONSE TYPE: PIE_CHART (Proportional Breakdown)

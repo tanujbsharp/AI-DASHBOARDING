@@ -223,6 +223,9 @@ class QueryOrchestrator:
                             size_after = query_body_after.get('size', 0)
                             logger.info(f"After fix: has_aggs={has_aggs_after}, size={size_after}")
             
+            # CRITICAL: Fix "most completed" queries to order by _count instead of unique_users
+            self._fix_most_completed_ordering(query_payload, user_message)
+            
             # CRITICAL: Remove collapse from any aggregation query (size: 0)
             # Collapse only works on hits, not aggregations. When size: 0, there are no hits, so collapse is useless.
             query_body = query_payload.get('query', {})
@@ -930,6 +933,7 @@ class QueryOrchestrator:
         # This ensures the chart shows names, not IDs
         if rank_by == 'module_name':
             # Group by module_name (for display), count unique users who completed
+            # For "most completed", order by _count (total completions), not unique_users
             query = {
                 "size": 0,
                 "query": bool_query,
@@ -938,7 +942,7 @@ class QueryOrchestrator:
                         "terms": {
                             "field": "module_name",  # Group by NAME for display
                             "size": 10,
-                            "order": {"unique_users": "desc"}
+                            "order": {"_count": "desc"}  # Order by total completions (doc_count)
                         },
                         "aggs": {
                             "unique_users": {"cardinality": {"field": "uid"}}  # Count unique users
@@ -956,7 +960,7 @@ class QueryOrchestrator:
                         "terms": {
                             "field": "email_addr",  # Group by EMAIL for display
                             "size": 10,
-                            "order": {"unique_modules": "desc"}
+                            "order": {"_count": "desc"}  # Order by total completions (doc_count)
                         },
                         "aggs": {
                             "unique_modules": {"cardinality": {"field": "mid"}}  # Count unique modules
@@ -974,7 +978,7 @@ class QueryOrchestrator:
                         "terms": {
                             "field": agg_field,
                             "size": 10,
-                            "order": {"unique_users": "desc"}
+                            "order": {"_count": "desc"}  # Order by total completions (doc_count)
                         },
                         "aggs": {
                             "unique_users": {"cardinality": {"field": "uid"}}
@@ -1663,6 +1667,61 @@ class QueryOrchestrator:
                 ensure_bucket_sort(agg_value)
         
         logger.info("Fixed completion rate query: removed invalid ordering, removed name/email filters, ensured bucket_sort")
+    
+    def _fix_most_completed_ordering(self, query_payload: Dict[str, Any], user_message: str):
+        """
+        Fix "most completed" queries to order by _count (total completions) instead of unique_users.
+        
+        When user asks for "most completed modules" or "graph of most completed modules",
+        they want modules sorted by total completion count (doc_count), not by unique users.
+        """
+        message_lower = user_message.lower()
+        
+        # Check if this is a "most completed" query
+        most_completed_keywords = ['most completed', 'most completions', 'top completed', 'most finished']
+        if not any(kw in message_lower for kw in most_completed_keywords):
+            return
+        
+        query_body = query_payload.get('query', {})
+        if not isinstance(query_body, dict):
+            return
+        
+        aggs = query_body.get('aggs', {})
+        if not isinstance(aggs, dict):
+            return
+        
+        def fix_ordering(agg_dict: Dict[str, Any]):
+            """Recursively fix ordering in aggregations."""
+            if not isinstance(agg_dict, dict):
+                return
+            
+            # Check if this is a terms aggregation with order
+            if 'terms' in agg_dict:
+                terms_agg = agg_dict['terms']
+                if isinstance(terms_agg, dict) and 'order' in terms_agg:
+                    order = terms_agg['order']
+                    
+                    # Check if ordering by unique_users (wrong for "most completed")
+                    if isinstance(order, dict) and 'unique_users' in order:
+                        logger.info("Fixing 'most completed' query: changing order from unique_users to _count")
+                        terms_agg['order'] = {'_count': 'desc'}
+                    elif isinstance(order, dict) and 'unique_modules' in order:
+                        # For user-based queries, also use _count
+                        logger.info("Fixing 'most completed' query: changing order from unique_modules to _count")
+                        terms_agg['order'] = {'_count': 'desc'}
+            
+            # Recursively check sub-aggregations
+            sub_aggs = agg_dict.get('aggs', {})
+            if isinstance(sub_aggs, dict):
+                for sub_agg in sub_aggs.values():
+                    fix_ordering(sub_agg)
+        
+        # Fix all aggregations
+        for agg_name, agg_value in aggs.items():
+            if isinstance(agg_value, dict):
+                fix_ordering(agg_value)
+        
+        logger.info("Fixed 'most completed' query ordering: changed from unique_users/unique_modules to _count")
     
     def _fix_unique_modules_query(self, query_payload: Dict[str, Any], entities: Dict[str, Any]):
         """

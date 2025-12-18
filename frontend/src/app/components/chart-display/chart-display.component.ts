@@ -179,18 +179,38 @@ export class ChartDisplayComponent implements OnChanges, AfterViewInit, OnDestro
   private boundHideTooltip = this.hideTooltip.bind(this);
   private hasAnimatedOnce = false;
 
-  // palette
+  // Expanded diverse color palette - 30 unique colors covering the full spectrum
   private colorPalette = [
-    'rgba(8, 145, 178, 0.8)',
-    'rgba(168, 85, 247, 0.8)',
-    'rgba(34, 197, 94, 0.8)',
-    'rgba(249, 115, 22, 0.8)',
-    'rgba(236, 72, 153, 0.8)',
-    'rgba(59, 130, 246, 0.8)',
-    'rgba(234, 179, 8, 0.8)',
-    'rgba(239, 68, 68, 0.8)',
-    'rgba(20, 184, 166, 0.8)',
-    'rgba(139, 92, 246, 0.8)',
+    'rgba(8, 145, 178, 0.8)',      // Cyan
+    'rgba(168, 85, 247, 0.8)',      // Purple
+    'rgba(34, 197, 94, 0.8)',      // Green
+    'rgba(249, 115, 22, 0.8)',     // Orange
+    'rgba(236, 72, 153, 0.8)',     // Pink
+    'rgba(59, 130, 246, 0.8)',     // Blue
+    'rgba(234, 179, 8, 0.8)',      // Yellow
+    'rgba(239, 68, 68, 0.8)',      // Red
+    'rgba(20, 184, 166, 0.8)',     // Teal
+    'rgba(139, 92, 246, 0.8)',     // Violet
+    'rgba(14, 165, 233, 0.8)',     // Sky Blue
+    'rgba(99, 102, 241, 0.8)',     // Indigo
+    'rgba(16, 185, 129, 0.8)',     // Emerald
+    'rgba(251, 146, 60, 0.8)',     // Amber
+    'rgba(244, 63, 94, 0.8)',      // Rose
+    'rgba(37, 99, 235, 0.8)',      // Blue
+    'rgba(250, 204, 21, 0.8)',     // Yellow
+    'rgba(220, 38, 38, 0.8)',      // Red
+    'rgba(6, 182, 212, 0.8)',      // Cyan
+    'rgba(124, 58, 237, 0.8)',     // Purple
+    'rgba(5, 150, 105, 0.8)',      // Green
+    'rgba(234, 88, 12, 0.8)',      // Orange
+    'rgba(219, 39, 119, 0.8)',     // Pink
+    'rgba(29, 78, 216, 0.8)',      // Blue
+    'rgba(202, 138, 4, 0.8)',      // Yellow
+    'rgba(185, 28, 28, 0.8)',      // Red
+    'rgba(13, 148, 136, 0.8)',     // Teal
+    'rgba(109, 40, 217, 0.8)',     // Violet
+    'rgba(2, 132, 199, 0.8)',      // Sky Blue
+    'rgba(79, 70, 229, 0.8)',     // Indigo
   ];
   private borderPalette = [
     'rgba(8, 145, 178, 1)',
@@ -203,6 +223,26 @@ export class ChartDisplayComponent implements OnChanges, AfterViewInit, OnDestro
     'rgba(239, 68, 68, 1)',
     'rgba(20, 184, 166, 1)',
     'rgba(139, 92, 246, 1)',
+    'rgba(14, 165, 233, 1)',
+    'rgba(99, 102, 241, 1)',
+    'rgba(16, 185, 129, 1)',
+    'rgba(251, 146, 60, 1)',
+    'rgba(244, 63, 94, 1)',
+    'rgba(37, 99, 235, 1)',
+    'rgba(250, 204, 21, 1)',
+    'rgba(220, 38, 38, 1)',
+    'rgba(6, 182, 212, 1)',
+    'rgba(124, 58, 237, 1)',
+    'rgba(5, 150, 105, 1)',
+    'rgba(234, 88, 12, 1)',
+    'rgba(219, 39, 119, 1)',
+    'rgba(29, 78, 216, 1)',
+    'rgba(202, 138, 4, 1)',
+    'rgba(185, 28, 28, 1)',
+    'rgba(13, 148, 136, 1)',
+    'rgba(109, 40, 217, 1)',
+    'rgba(2, 132, 199, 1)',
+    'rgba(79, 70, 229, 1)',
   ];
 
   constructor(private zone: NgZone) {}
@@ -422,8 +462,13 @@ export class ChartDisplayComponent implements OnChanges, AfterViewInit, OnDestro
     const actualType: ChartType = isHorizontal ? 'bar' : (chartType as ChartType);
 
     const dataLength = this.chartData.labels.length;
-    const backgroundColors = this.colorPalette.slice(0, Math.max(1, dataLength));
-    const borderColors = this.borderPalette.slice(0, Math.max(1, dataLength));
+    // Generate colors by cycling through the palette for each data point
+    const backgroundColors = Array.from({ length: dataLength }, (_, i) => 
+      this.colorPalette[i % this.colorPalette.length]
+    );
+    const borderColors = Array.from({ length: dataLength }, (_, i) => 
+      this.borderPalette[i % this.borderPalette.length]
+    );
 
     const datasets = this.chartData.datasets.map((ds, i) => ({
       ...ds,
