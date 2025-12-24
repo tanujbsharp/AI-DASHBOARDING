@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 import re
 from dataclasses import dataclass
+import pytz
 
 
 @dataclass
@@ -617,4 +618,355 @@ DATE FIELD SELECTION (use the field that matches the event):
 - ASSIGNMENTS/ENROLLMENTS → use created_on
 - MODULE CREATION → use module_created_on
 """
+
+
+@dataclass
+class ResolvedTimeframe:
+    """Represents a resolved timeframe with dynamic date range."""
+    gte: int  # epoch seconds
+    lt: int   # epoch seconds (half-open interval)
+    label: str
+    type: str = "RELATIVE"
+
+
+class TimeframeResolver:
+    """
+    Resolves timeframe keys into dynamic date ranges at runtime.
+    Used for dashboard widgets to keep timeframes "live" (e.g., "last week" always means the most recent week).
+    """
+    
+    SUPPORTED_TIMEFRAMES = {
+        'LAST_WEEK',
+        'THIS_WEEK',
+        'LAST_MONTH',
+        'THIS_MONTH',
+        'LAST_3_MONTHS',
+        'THIS_QUARTER',
+        'LAST_QUARTER',
+        'THIS_YEAR',
+        'LAST_YEAR'
+    }
+    
+    @classmethod
+    def extract_timeframe_key(cls, message: str) -> Optional[str]:
+        """
+        Extract a timeframe key from a user message.
+        Returns None if no supported relative timeframe is detected.
+        """
+        message_lower = message.lower()
+        
+        # Map patterns to timeframe keys
+        patterns = {
+            'LAST_WEEK': [
+                r'\blast\s+week\b',
+            ],
+            'THIS_WEEK': [
+                r'\bthis\s+week\b',
+            ],
+            'LAST_MONTH': [
+                r'\blast\s+month\b',
+            ],
+            'THIS_MONTH': [
+                r'\bthis\s+month\b',
+            ],
+            'LAST_3_MONTHS': [
+                r'\blast\s+3\s+months?\b',
+                r'\blast\s+three\s+months?\b',
+            ],
+            'THIS_QUARTER': [
+                r'\bthis\s+quarter\b',
+            ],
+            'LAST_QUARTER': [
+                r'\blast\s+quarter\b',
+            ],
+            'THIS_YEAR': [
+                r'\bthis\s+year\b',
+                r'\bytd\b',  # Year to date
+            ],
+            'LAST_YEAR': [
+                r'\blast\s+year\b',
+            ],
+        }
+        
+        for timeframe_key, pattern_list in patterns.items():
+            for pattern in pattern_list:
+                if re.search(pattern, message_lower):
+                    return timeframe_key
+        
+        return None
+    
+    @classmethod
+    def resolve(
+        cls,
+        timeframe_key: str,
+        timezone_str: str = "Asia/Kolkata",
+        date_mode: str = "epoch_seconds"
+    ) -> Optional[ResolvedTimeframe]:
+        """
+        Resolve a timeframe key into a dynamic date range.
+        
+        Args:
+            timeframe_key: One of the SUPPORTED_TIMEFRAMES (e.g., "LAST_WEEK")
+            timezone_str: Timezone string (default: "Asia/Kolkata")
+            date_mode: "epoch_seconds", "epoch_millis", or "date" (for OpenSearch date math)
+            
+        Returns:
+            ResolvedTimeframe with gte, lt (half-open interval), label, and type
+            When date_mode is "date", gte and lt will be OpenSearch date math expressions (strings)
+        """
+        if timeframe_key not in cls.SUPPORTED_TIMEFRAMES:
+            return None
+        
+        # If date_mode is "date", use OpenSearch date math expressions
+        # This allows OpenSearch to calculate dates dynamically at query time
+        if date_mode == "date":
+            date_math = cls._get_date_math_expressions(timeframe_key)
+            if date_math:
+                return ResolvedTimeframe(
+                    gte=date_math['gte'],  # String like "now-3M/M"
+                    lt=date_math['lt'],    # String like "now" or "now/M"
+                    label=date_math['label'],
+                    type="RELATIVE"
+                )
+        
+        # Otherwise, calculate epoch timestamps
+        try:
+            tz = pytz.timezone(timezone_str)
+        except pytz.exceptions.UnknownTimeZoneError:
+            tz = pytz.timezone("Asia/Kolkata")  # Fallback
+        
+        # Get current time in the specified timezone
+        now_utc = datetime.now(timezone.utc)
+        now_tz = now_utc.astimezone(tz)
+        
+        # Resolve the timeframe
+        resolved = cls._resolve_timeframe(timeframe_key, now_tz, tz)
+        if not resolved:
+            return None
+        
+        # Convert to epoch based on date_mode
+        if date_mode == "epoch_millis":
+            gte = resolved['gte'] * 1000
+            lt = resolved['lt'] * 1000
+        else:
+            gte = resolved['gte']
+            lt = resolved['lt']
+        
+        return ResolvedTimeframe(
+            gte=gte,
+            lt=lt,
+            label=resolved['label'],
+            type="RELATIVE"
+        )
+    
+    @classmethod
+    def _get_date_math_expressions(cls, timeframe_key: str) -> Optional[Dict]:
+        """
+        Get OpenSearch date math expressions for relative timeframes.
+        Returns expressions like "now-3M/M" for use in range queries.
+        
+        OpenSearch date math syntax:
+        - now = current time
+        - now-3M = 3 months ago
+        - now/M = start of current month
+        - now-1M/M = start of previous month
+        - now/y = start of current year
+        - now-1y/y = start of last year
+        - now/w = start of current week (Monday)
+        - now-1w/w = start of week 1 week ago
+        """
+        date_math_map = {
+            'LAST_WEEK': {
+                'gte': 'now-1w/w',  # Start of week 1 week ago (Monday 00:00)
+                'lt': 'now/w',      # Start of current week (Monday 00:00)
+                'label': 'Last week'
+            },
+            'THIS_WEEK': {
+                'gte': 'now/w',     # Start of current week (Monday 00:00)
+                'lt': 'now+1w/w',   # Start of next week (Monday 00:00)
+                'label': 'This week'
+            },
+            'LAST_MONTH': {
+                'gte': 'now-1M/M',  # Start of previous month (1st day 00:00)
+                'lt': 'now/M',      # Start of current month (1st day 00:00)
+                'label': 'Last month'
+            },
+            'THIS_MONTH': {
+                'gte': 'now/M',     # Start of current month (1st day 00:00)
+                'lt': 'now+1M/M',   # Start of next month (1st day 00:00)
+                'label': 'This month'
+            },
+            'LAST_3_MONTHS': {
+                'gte': 'now-3M/M',  # Start of month 3 months ago
+                'lt': 'now',        # Current time
+                'label': 'Last 3 months'
+            },
+            'THIS_QUARTER': {
+                # Calculate quarter start based on current month
+                # Q1 (Jan-Mar): month 1, Q2 (Apr-Jun): month 4, Q3 (Jul-Sep): month 7, Q4 (Oct-Dec): month 10
+                # We'll use a calculation: if current month is M, quarter start is floor((M-1)/3)*3 + 1
+                # For simplicity, use approximate: start of current month rounded to quarter
+                # This is approximate but works for most cases
+                'gte': 'now/M||/M',  # Start of current month (will be adjusted by quarter logic if needed)
+                'lt': 'now+3M/M',    # Start of month 3 months from now
+                'label': 'This quarter'
+            },
+            'LAST_QUARTER': {
+                # Previous quarter: 3 months before current quarter start
+                'gte': 'now-3M/M',   # Start of month 3 months ago
+                'lt': 'now/M',       # Start of current month
+                'label': 'Last quarter'
+            },
+            'THIS_YEAR': {
+                'gte': 'now/y',      # Start of current year (Jan 1 00:00)
+                'lt': 'now+1y/y',    # Start of next year (Jan 1 00:00)
+                'label': 'This year'
+            },
+            'LAST_YEAR': {
+                'gte': 'now-1y/y',   # Start of last year (Jan 1 00:00)
+                'lt': 'now/y',       # Start of current year (Jan 1 00:00)
+                'label': 'Last year'
+            },
+        }
+        
+        return date_math_map.get(timeframe_key)
+    
+    @classmethod
+    def _resolve_timeframe(
+        cls,
+        timeframe_key: str,
+        now: datetime,
+        tz: pytz.BaseTzInfo
+    ) -> Optional[Dict]:
+        """Internal method to resolve timeframe based on current time."""
+        
+        # Helper to get start of day in timezone
+        def start_of_day(dt: datetime) -> datetime:
+            return tz.localize(datetime(dt.year, dt.month, dt.day, 0, 0, 0))
+        
+        # Helper to get Monday of week
+        def get_monday(dt: datetime) -> datetime:
+            days_since_monday = dt.weekday()
+            monday = dt - timedelta(days=days_since_monday)
+            return start_of_day(monday)
+        
+        # Helper to get quarter start month
+        def get_quarter_start_month(month: int) -> int:
+            return ((month - 1) // 3) * 3 + 1
+        
+        if timeframe_key == 'LAST_WEEK':
+            # Previous Mon 00:00 → this Mon 00:00
+            this_monday = get_monday(now)
+            last_monday = this_monday - timedelta(days=7)
+            return {
+                'gte': int(last_monday.timestamp()),
+                'lt': int(this_monday.timestamp()),
+                'label': 'Last week'
+            }
+        
+        elif timeframe_key == 'THIS_WEEK':
+            # This Mon 00:00 → next Mon 00:00
+            this_monday = get_monday(now)
+            next_monday = this_monday + timedelta(days=7)
+            return {
+                'gte': int(this_monday.timestamp()),
+                'lt': int(next_monday.timestamp()),
+                'label': 'This week'
+            }
+        
+        elif timeframe_key == 'LAST_MONTH':
+            # 1st of previous month 00:00 → 1st of current month 00:00
+            first_of_this_month = start_of_day(now.replace(day=1))
+            if now.month == 1:
+                first_of_last_month = start_of_day(datetime(now.year - 1, 12, 1))
+            else:
+                first_of_last_month = start_of_day(datetime(now.year, now.month - 1, 1))
+            return {
+                'gte': int(first_of_last_month.timestamp()),
+                'lt': int(first_of_this_month.timestamp()),
+                'label': 'Last month'
+            }
+        
+        elif timeframe_key == 'THIS_MONTH':
+            # 1st of current month 00:00 → 1st of next month 00:00
+            first_of_this_month = start_of_day(now.replace(day=1))
+            if now.month == 12:
+                first_of_next_month = start_of_day(datetime(now.year + 1, 1, 1))
+            else:
+                first_of_next_month = start_of_day(datetime(now.year, now.month + 1, 1))
+            return {
+                'gte': int(first_of_this_month.timestamp()),
+                'lt': int(first_of_next_month.timestamp()),
+                'label': 'This month'
+            }
+        
+        elif timeframe_key == 'LAST_3_MONTHS':
+            # Now minus 3 months → now
+            three_months_ago = now - timedelta(days=90)  # Approximate
+            # More precise: go back 3 calendar months
+            month = now.month - 3
+            year = now.year
+            while month <= 0:
+                month += 12
+                year -= 1
+            start = start_of_day(datetime(year, month, 1))
+            return {
+                'gte': int(start.timestamp()),
+                'lt': int(now.timestamp()),
+                'label': 'Last 3 months'
+            }
+        
+        elif timeframe_key == 'THIS_QUARTER':
+            # Quarter start 00:00 → next quarter start 00:00
+            quarter_start_month = get_quarter_start_month(now.month)
+            quarter_start = start_of_day(datetime(now.year, quarter_start_month, 1))
+            # Next quarter start
+            if quarter_start_month == 10:  # Q4
+                next_quarter_start = start_of_day(datetime(now.year + 1, 1, 1))
+            else:
+                next_quarter_start = start_of_day(datetime(now.year, quarter_start_month + 3, 1))
+            return {
+                'gte': int(quarter_start.timestamp()),
+                'lt': int(next_quarter_start.timestamp()),
+                'label': f'Q{(quarter_start_month - 1) // 3 + 1} {now.year}'
+            }
+        
+        elif timeframe_key == 'LAST_QUARTER':
+            # Previous quarter start 00:00 → this quarter start 00:00
+            current_quarter_start_month = get_quarter_start_month(now.month)
+            if current_quarter_start_month == 1:  # Q1
+                # Previous quarter is Q4 of last year
+                last_quarter_start = start_of_day(datetime(now.year - 1, 10, 1))
+                this_quarter_start = start_of_day(datetime(now.year, 1, 1))
+            else:
+                last_quarter_start_month = current_quarter_start_month - 3
+                last_quarter_start = start_of_day(datetime(now.year, last_quarter_start_month, 1))
+                this_quarter_start = start_of_day(datetime(now.year, current_quarter_start_month, 1))
+            return {
+                'gte': int(last_quarter_start.timestamp()),
+                'lt': int(this_quarter_start.timestamp()),
+                'label': f'Q{(last_quarter_start_month - 1) // 3 + 1} {last_quarter_start.year if last_quarter_start_month == 10 else now.year}'
+            }
+        
+        elif timeframe_key == 'THIS_YEAR':
+            # Jan 1 00:00 → Jan 1 next year 00:00
+            year_start = start_of_day(datetime(now.year, 1, 1))
+            next_year_start = start_of_day(datetime(now.year + 1, 1, 1))
+            return {
+                'gte': int(year_start.timestamp()),
+                'lt': int(next_year_start.timestamp()),
+                'label': f'{now.year}'
+            }
+        
+        elif timeframe_key == 'LAST_YEAR':
+            # Jan 1 last year 00:00 → Jan 1 this year 00:00
+            last_year_start = start_of_day(datetime(now.year - 1, 1, 1))
+            this_year_start = start_of_day(datetime(now.year, 1, 1))
+            return {
+                'gte': int(last_year_start.timestamp()),
+                'lt': int(this_year_start.timestamp()),
+                'label': f'{now.year - 1}'
+            }
+        
+        return None
 

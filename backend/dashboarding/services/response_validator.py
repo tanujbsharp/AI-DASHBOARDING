@@ -219,14 +219,41 @@ class ResponseValidator:
                 # Buckets
                 if 'buckets' in agg_value:
                     buckets = agg_value['buckets']
-                    valid.add(len(buckets))  # Number of buckets
-                    for bucket in buckets:
+                    # Handle both list and dict formats for buckets
+                    if isinstance(buckets, dict):
+                        # If buckets is a dict, convert to list of bucket objects
+                        bucket_list = list(buckets.values())
+                    elif isinstance(buckets, list):
+                        # If buckets is a list, use it directly
+                        bucket_list = buckets
+                    else:
+                        bucket_list = []
+                    
+                    valid.add(len(bucket_list))  # Number of buckets
+                    for bucket in bucket_list:
+                        # Skip if bucket is not a dict (shouldn't happen, but be safe)
+                        if not isinstance(bucket, dict):
+                            continue
                         if 'doc_count' in bucket:
                             valid.add(int(bucket['doc_count']))
                         # Nested aggregations in bucket
                         for key, val in bucket.items():
-                            if isinstance(val, dict) and 'value' in val:
-                                valid.add(int(val['value']))
+                            if isinstance(val, dict):
+                                # Extract value (for metrics like completion_rate, assigned, etc.)
+                                if 'value' in val:
+                                    value = val['value']
+                                    # Handle both int and float values (completion rates are floats)
+                                    if isinstance(value, (int, float)):
+                                        valid.add(int(value))
+                                        # For percentages/rates, also add rounded versions
+                                        if isinstance(value, float) and 0 <= value <= 100:
+                                            valid.add(int(round(value)))
+                                            valid.add(int(round(value * 10) / 10))  # One decimal place
+                                # Recurse into nested aggregations (e.g., completed.completed_count.value)
+                                nested_aggs = {k: v for k, v in val.items() 
+                                             if isinstance(v, dict) and k != 'value'}
+                                if nested_aggs:
+                                    cls._extract_numbers_from_aggregations(nested_aggs, valid, total)
                 
                 # Stats
                 for stat in ['min', 'max', 'avg', 'sum', 'count']:
@@ -395,8 +422,18 @@ class ResponseValidator:
             for agg_name, agg_value in aggregations.items():
                 if isinstance(agg_value, dict) and 'buckets' in agg_value:
                     buckets = agg_value.get('buckets', [])
-                    if buckets:
-                        top_bucket = buckets[0]
+                    # Handle both list and dict formats for buckets
+                    if isinstance(buckets, dict):
+                        # If buckets is a dict, convert to list of bucket objects
+                        bucket_list = list(buckets.values())
+                    elif isinstance(buckets, list):
+                        # If buckets is a list, use it directly
+                        bucket_list = buckets
+                    else:
+                        bucket_list = []
+                    
+                    if bucket_list and isinstance(bucket_list[0], dict):
+                        top_bucket = bucket_list[0]
                         key = top_bucket.get('key', 'Unknown')
                         # Get count from nested cardinality or doc_count
                         count = top_bucket.get('doc_count', 0)

@@ -273,7 +273,25 @@ class ConversationContextManager:
     Manages conversation contexts across sessions.
     In production, this would integrate with a session store (Redis, etc.)
     """
-    
+
+    MODULE_KEYWORDS = [
+        'module', 'modules',
+        'training', 'trainings',
+        'course', 'courses',
+        'program', 'programs',
+        'lesson', 'lessons',
+        'curriculum'
+    ]
+
+    NON_PUBLISHED_MODULE_KEYWORDS = [
+        'draft', 'drafts',
+        'unpublished', 'unpublish',
+        'deleted', 'delete',
+        'retired', 'retire',
+        'removed', 'remove',
+        'archived', 'archive'
+    ]
+
     def __init__(self):
         self._contexts: Dict[str, ConversationContext] = {}
     
@@ -374,12 +392,19 @@ class ConversationContextManager:
                 message
             )
         
-        # Update module status filter
+        # Update module status filter (default to published=0 unless user explicitly asked for drafts/deleted)
         if 'module_status_filter' in extracted_entities:
             context.set_filter(
                 FilterType.MODULE_STATUS,
                 "module_status",
                 extracted_entities['module_status_filter'],
+                message
+            )
+        elif self._message_mentions_modules(message) and not self._message_mentions_non_published_modules(message):
+            context.set_filter(
+                FilterType.MODULE_STATUS,
+                "module_status",
+                0,
                 message
             )
         
@@ -410,6 +435,14 @@ class ConversationContextManager:
         # Update breakdown dimension (Section H)
         if extracted_entities.get('group_by'):
             context.set_breakdown_dimension(extracted_entities['group_by'], message)
+
+    def _message_mentions_modules(self, message: str) -> bool:
+        message_lower = message.lower()
+        return any(keyword in message_lower for keyword in self.MODULE_KEYWORDS)
+
+    def _message_mentions_non_published_modules(self, message: str) -> bool:
+        message_lower = message.lower()
+        return any(keyword in message_lower for keyword in self.NON_PUBLISHED_MODULE_KEYWORDS)
     
     def _is_independent_question(
         self, 

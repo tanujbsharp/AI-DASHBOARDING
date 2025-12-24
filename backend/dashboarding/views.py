@@ -174,11 +174,34 @@ class ExecuteQueryView(APIView):
         query = data.get('query')
         size = data.get('size')
         
+        # Extract timeframe metadata if present (for dashboard widgets)
+        timeframe_key = data.get('timeframe_key')
+        timeframe_timezone = data.get('timezone', 'Asia/Kolkata')
+        timeframe_date_field = data.get('date_field', 'completed_date')
+        timeframe_date_mode = data.get('date_mode', 'epoch_seconds')
+        
         if not index_id or not query:
             return Response(
                 {'error': 'index_id and query are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        # Resolve timeframe if provided (for dynamic date ranges)
+        if timeframe_key:
+            from dashboarding.services.time_handler import TimeframeResolver
+            resolved = TimeframeResolver.resolve(
+                timeframe_key=timeframe_key,
+                timezone_str=timeframe_timezone,
+                date_mode=timeframe_date_mode
+            )
+            if resolved:
+                # Inject the resolved date range into the query
+                query = self._inject_timeframe_range(
+                    query,
+                    resolved,
+                    timeframe_date_field,
+                    timeframe_date_mode
+                )
 
         # If a size is explicitly provided, force it onto the query even if the query already has "size"
         if size is not None:
@@ -194,6 +217,68 @@ class ExecuteQueryView(APIView):
             return Response(result, status=status.HTTP_400_BAD_REQUEST)
         
         return Response(result)
+    
+    def _inject_timeframe_range(
+        self,
+        query: dict,
+        resolved_timeframe,
+        date_field: str,
+        date_mode: str
+    ) -> dict:
+        """
+        Inject resolved timeframe range into query.
+        Handles both top-level query filters and nested aggregation filters.
+        """
+        # Ensure query has a bool structure
+        if 'query' not in query:
+            query['query'] = {'match_all': {}}
+        
+        query_body = query['query']
+        
+        # Ensure bool query structure
+        if 'bool' not in query_body:
+            if 'match_all' in query_body:
+                query_body = {'bool': {'filter': []}}
+            else:
+                query_body = {'bool': {'must': [query_body], 'filter': []}}
+            query['query'] = query_body
+        
+        bool_query = query_body['bool']
+        if 'filter' not in bool_query:
+            bool_query['filter'] = []
+        
+        # Build range filter
+        # Handle both date math expressions (strings) and epoch timestamps (numbers)
+        range_clause = {}
+        if isinstance(resolved_timeframe.gte, str):
+            # Date math expression (e.g., "now-3M/M")
+            range_clause['gte'] = resolved_timeframe.gte
+        else:
+            # Epoch timestamp (number)
+            range_clause['gte'] = resolved_timeframe.gte
+        
+        if isinstance(resolved_timeframe.lt, str):
+            # Date math expression
+            range_clause['lt'] = resolved_timeframe.lt
+        else:
+            # Epoch timestamp
+            range_clause['lt'] = resolved_timeframe.lt
+        
+        range_filter = {
+            'range': {
+                date_field: range_clause
+            }
+        }
+        
+        # Add to filter array (avoid duplicates)
+        filters = bool_query['filter']
+        if not any(
+            isinstance(f, dict) and f.get('range', {}).get(date_field) == range_filter['range'][date_field]
+            for f in filters
+        ):
+            filters.append(range_filter)
+        
+        return query
 
 
 class EnrichedSchemaView(APIView):

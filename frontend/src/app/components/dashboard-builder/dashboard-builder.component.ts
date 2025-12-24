@@ -13,6 +13,10 @@ interface WidgetData extends GridsterItem {
   isLoading?: boolean;
   error?: string;
   queryResult?: any;
+  pagination?: {
+    currentPage: number;
+    pageSize: number;
+  };
 }
 
 type Layout = { x: number; y: number; cols: number; rows: number };
@@ -212,9 +216,9 @@ type Layout = { x: number; y: number; cols: number; rows: number };
                                 </tr>
                               </thead>
                               <tbody>
-                                @for (row of widget.queryResult.results.slice(0, 50); track $index; let i = $index) {
+                                @for (row of getPaginatedResults(widget); track $index; let i = $index) {
                                   <tr>
-                                    <td class="row-num">{{ i + 1 }}</td>
+                                    <td class="row-num">{{ getRowNumber(widget, i) }}</td>
                                     @for (col of getTableColumns(row, widget.item.render_config.fields_to_show); track col) {
                                       <td>{{ formatFieldValue(row[col]) }}</td>
                                     }
@@ -222,11 +226,49 @@ type Layout = { x: number; y: number; cols: number; rows: number };
                                 }
                               </tbody>
                             </table>
-                            @if (widget.queryResult.results.length > 50) {
-                              <div class="table-footer">
-                                Showing 50 of {{ widget.queryResult.total || widget.queryResult.results.length }} results
+                            <div class="table-pagination">
+                              <div class="pagination-info">
+                                Showing {{ getPaginationStart(widget) }}-{{ getPaginationEnd(widget) }} of {{ getTotalResults(widget) }} results
                               </div>
-                            }
+                              <div class="pagination-controls">
+                                <button 
+                                  class="pagination-btn" 
+                                  [disabled]="getCurrentPage(widget) === 1"
+                                  (click)="goToPage(widget, getCurrentPage(widget) - 1)"
+                                  title="Previous page"
+                                >
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="15 18 9 12 15 6"/>
+                                  </svg>
+                                </button>
+                                <span class="page-info">
+                                  Page {{ getCurrentPage(widget) }} of {{ getTotalPages(widget) }}
+                                </span>
+                                <button 
+                                  class="pagination-btn" 
+                                  [disabled]="getCurrentPage(widget) >= getTotalPages(widget)"
+                                  (click)="goToPage(widget, getCurrentPage(widget) + 1)"
+                                  title="Next page"
+                                >
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="9 18 15 12 9 6"/>
+                                  </svg>
+                                </button>
+                              </div>
+                              <div class="pagination-size">
+                                <label>Rows per page:</label>
+                                <select 
+                                  [value]="getPageSize(widget)" 
+                                  (change)="changePageSize(widget, $any($event.target).value)"
+                                  class="page-size-select"
+                                >
+                                  <option value="10">10</option>
+                                  <option value="20">20</option>
+                                  <option value="50">50</option>
+                                  <option value="100">100</option>
+                                </select>
+                              </div>
+                            </div>
                           } @else if (widget.queryResult?.aggregations) {
                             <div class="empty-widget">
                               <p>This query returns aggregations, not table data.</p>
@@ -490,6 +532,93 @@ type Layout = { x: number; y: number; cols: number; rows: number };
     .data-table tbody tr:hover td { background: var(--bg-tertiary, #f9fafb); }
 
     .table-footer { padding: var(--spacing-sm, 12px); text-align: center; font-size: 0.75rem; color: var(--text-tertiary, #9ca3af); border-top: 1px solid var(--border-primary, #e5e7eb); }
+    
+    .table-pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: var(--spacing-sm, 12px);
+      border-top: 1px solid var(--border-primary, #e5e7eb);
+      background: var(--bg-tertiary, #f9fafb);
+      flex-wrap: wrap;
+      gap: var(--spacing-sm, 12px);
+    }
+    
+    .pagination-info {
+      font-size: 0.75rem;
+      color: var(--text-secondary, #6b7280);
+    }
+    
+    .pagination-controls {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm, 12px);
+    }
+    
+    .pagination-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      background: white;
+      border: 1px solid var(--border-primary, #e5e7eb);
+      border-radius: var(--radius-sm, 4px);
+      color: var(--text-secondary, #6b7280);
+      cursor: pointer;
+      transition: all 0.2s;
+      
+      &:hover:not(:disabled) {
+        background: var(--bg-card-hover, #f3f4f6);
+        border-color: var(--accent-primary, #0891b2);
+        color: var(--accent-primary, #0891b2);
+      }
+      
+      &:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+    }
+    
+    .page-info {
+      font-size: 0.75rem;
+      color: var(--text-secondary, #6b7280);
+      font-weight: 500;
+      min-width: 80px;
+      text-align: center;
+    }
+    
+    .pagination-size {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-xs, 8px);
+      
+      label {
+        font-size: 0.75rem;
+        color: var(--text-secondary, #6b7280);
+      }
+    }
+    
+    .page-size-select {
+      padding: 4px 8px;
+      border: 1px solid var(--border-primary, #e5e7eb);
+      border-radius: var(--radius-sm, 4px);
+      background: white;
+      color: var(--text-primary, #1f2937);
+      font-size: 0.75rem;
+      cursor: pointer;
+      
+      &:hover {
+        border-color: var(--accent-primary, #0891b2);
+      }
+      
+      &:focus {
+        outline: none;
+        border-color: var(--accent-primary, #0891b2);
+        box-shadow: 0 0 0 2px rgba(8, 145, 178, 0.1);
+      }
+    }
+    
     .empty-widget { padding: var(--spacing-xl, 32px); text-align: center; color: var(--text-tertiary, #9ca3af); }
   `]
 })
@@ -747,7 +876,17 @@ export class DashboardBuilderComponent implements OnInit, OnDestroy {
       return;
     }
 
-    this.apiService.executeQuery(widget.item.index_id, widget.item.query_payload).subscribe({
+    // Pass timeframe metadata if available for dynamic date range resolution
+    // Default to "date" mode to use OpenSearch date math expressions (e.g., "now-3M/M")
+    this.apiService.executeQuery(
+      widget.item.index_id,
+      widget.item.query_payload,
+      undefined, // size
+      widget.item.timeframe_key,
+      widget.item.timezone || 'Asia/Kolkata',
+      widget.item.date_field || 'completed_date',
+      widget.item.date_mode || 'date'  // Use date math by default
+    ).subscribe({
       next: (result) => {
         widget.isLoading = false;
         widget.queryResult = this.normalizeQueryResultForWidget(result, widget.item);
@@ -814,19 +953,82 @@ export class DashboardBuilderComponent implements OnInit, OnDestroy {
       if (!value || typeof value !== 'object') continue;
       const metricInfo = metrics?.[key] as { label?: string; description?: string } | undefined;
 
+      // Handle completion rate structure (simplified format from backend)
+      if (key === 'scope' && 'value' in value && 'formatted_value' in value) {
+        // This is a completion rate in simplified format
+        kpis.push({
+          label: value._label || metricInfo?.label || 'Completion Rate',
+          value: value.value,
+          description: metricInfo?.description || `Completion rate: ${value.formatted_value || `${value.value}%`}`
+        });
+        continue;
+      }
+
+      // Handle completion rate in nested structure (scope.buckets.all.completion_rate.value)
+      if (key === 'scope' && 'buckets' in value) {
+        const buckets = value.buckets;
+        if (typeof buckets === 'object' && buckets !== null) {
+          // Handle dict format: buckets.all
+          const allBucket = buckets.all || (typeof buckets === 'object' && !Array.isArray(buckets) ? Object.values(buckets)[0] : null);
+          if (allBucket && typeof allBucket === 'object') {
+            const completionRate = allBucket.completion_rate;
+            if (completionRate && typeof completionRate === 'object' && 'value' in completionRate) {
+              const rateValue = completionRate.value;
+              kpis.push({
+                label: value._label || metricInfo?.label || 'Completion Rate',
+                value: rateValue,
+                description: metricInfo?.description || `Completion rate: ${rateValue.toFixed(1)}%`
+              });
+              continue;
+            }
+          }
+        }
+      }
+
+      // Handle user completion rate structure (user.buckets[0].completion_rate.value)
+      if (key === 'user' && 'buckets' in value) {
+        const buckets = value.buckets;
+        if (Array.isArray(buckets) && buckets.length > 0) {
+          const firstBucket = buckets[0];
+          if (firstBucket && typeof firstBucket === 'object') {
+            const completionRate = firstBucket.completion_rate;
+            if (completionRate && typeof completionRate === 'object' && 'value' in completionRate) {
+              const rateValue = completionRate.value;
+              kpis.push({
+                label: value._label || metricInfo?.label || 'Completion Rate',
+                value: rateValue,
+                description: metricInfo?.description || `Completion rate: ${rateValue.toFixed(1)}%`
+              });
+              continue;
+            }
+          }
+        }
+      }
+
+      // Standard handling for other aggregations
       if ('value' in value) {
-        kpis.push({ label: metricInfo?.label || this.humanize(key), value: value.value, description: metricInfo?.description });
+        kpis.push({ label: metricInfo?.label || value._label || this.humanize(key), value: value.value, description: metricInfo?.description });
       } else if ('doc_count' in value) {
-        kpis.push({ label: metricInfo?.label || this.humanize(key), value: value.doc_count, description: metricInfo?.description });
+        kpis.push({ label: metricInfo?.label || value._label || this.humanize(key), value: value.doc_count, description: metricInfo?.description });
       }
     }
     return kpis;
   }
 
   formatNumber(value: number): string {
+    // Handle percentage values (completion rates are typically 0-100)
+    // If value is between 0-100 and looks like a percentage, format as percentage
+    if (value >= 0 && value <= 100 && value % 1 !== 0) {
+      return `${value.toFixed(1)}%`;
+    }
+    // Handle large numbers
     if (value >= 1000000) return (value / 1000000).toFixed(1) + 'M';
     if (value >= 1000) return (value / 1000).toFixed(1) + 'K';
-    return value.toLocaleString();
+    // For integers, use locale string; for decimals, show 1 decimal place
+    if (value % 1 === 0) {
+      return value.toLocaleString();
+    }
+    return value.toFixed(1);
   }
 
   humanize(str: string): string {
@@ -949,11 +1151,46 @@ export class DashboardBuilderComponent implements OnInit, OnDestroy {
     if (!row) return [];
     const skip = ['_id', '_score'];
     const keys = Object.keys(row).filter((k) => !skip.includes(k));
-    if (preferredFields?.length) {
-      const available = preferredFields.filter((f) => keys.includes(f));
-      return available.length > 0 ? available : keys.slice(0, 8);
+    
+    // CRITICAL: Always prioritize first_name, last_name, email_addr at the start
+    const priorityFields = ['first_name', 'last_name', 'email_addr'];
+    const orderedKeys: string[] = [];
+    const seenFields = new Set<string>();
+    
+    // First, add priority fields if they exist
+    for (const priorityField of priorityFields) {
+      if (keys.includes(priorityField) && !seenFields.has(priorityField)) {
+        orderedKeys.push(priorityField);
+        seenFields.add(priorityField);
+      }
     }
-    return keys.slice(0, 8);
+    
+    if (preferredFields?.length) {
+      // Then add preferred fields (excluding priority fields already added)
+      for (const field of preferredFields) {
+        if (keys.includes(field) && !seenFields.has(field)) {
+          orderedKeys.push(field);
+          seenFields.add(field);
+        }
+      }
+    } else {
+      // If no preferred fields, add remaining keys in their original order
+      for (const key of keys) {
+        if (!seenFields.has(key)) {
+          orderedKeys.push(key);
+          seenFields.add(key);
+        }
+      }
+    }
+    
+    // Add any remaining keys that weren't in priority or preferred
+    for (const key of keys) {
+      if (!seenFields.has(key)) {
+        orderedKeys.push(key);
+      }
+    }
+    
+    return orderedKeys.slice(0, 8);
   }
 
   formatFieldName(key: string): string {
@@ -1285,5 +1522,75 @@ export class DashboardBuilderComponent implements OnInit, OnDestroy {
       }
     }
     return null;
+  }
+
+  // Pagination helper methods
+  private ensurePagination(widget: WidgetData) {
+    if (!widget.pagination) {
+      widget.pagination = { currentPage: 1, pageSize: 20 };
+    }
+  }
+
+  getCurrentPage(widget: WidgetData): number {
+    this.ensurePagination(widget);
+    return widget.pagination!.currentPage;
+  }
+
+  getPageSize(widget: WidgetData): number {
+    this.ensurePagination(widget);
+    return widget.pagination!.pageSize;
+  }
+
+  getTotalResults(widget: WidgetData): number {
+    return widget.queryResult?.total || widget.queryResult?.results?.length || 0;
+  }
+
+  getTotalPages(widget: WidgetData): number {
+    const totalResults = this.getTotalResults(widget);
+    const pageSize = this.getPageSize(widget);
+    return Math.ceil(totalResults / pageSize);
+  }
+
+  getPaginationStart(widget: WidgetData): number {
+    const currentPage = this.getCurrentPage(widget);
+    const pageSize = this.getPageSize(widget);
+    return (currentPage - 1) * pageSize + 1;
+  }
+
+  getPaginationEnd(widget: WidgetData): number {
+    const start = this.getPaginationStart(widget);
+    const pageSize = this.getPageSize(widget);
+    const totalResults = this.getTotalResults(widget);
+    return Math.min(start + pageSize - 1, totalResults);
+  }
+
+  getPaginatedResults(widget: WidgetData): any[] {
+    if (!widget.queryResult?.results?.length) return [];
+    this.ensurePagination(widget);
+    const pageSize = widget.pagination!.pageSize;
+    const currentPage = widget.pagination!.currentPage;
+    const startIndex = (currentPage - 1) * pageSize;
+    const endIndex = startIndex + pageSize;
+    return widget.queryResult.results.slice(startIndex, endIndex);
+  }
+
+  getRowNumber(widget: WidgetData, index: number): number {
+    const currentPage = this.getCurrentPage(widget);
+    const pageSize = this.getPageSize(widget);
+    return (currentPage - 1) * pageSize + index + 1;
+  }
+
+  goToPage(widget: WidgetData, page: number) {
+    this.ensurePagination(widget);
+    const totalPages = this.getTotalPages(widget);
+    if (page >= 1 && page <= totalPages) {
+      widget.pagination!.currentPage = page;
+    }
+  }
+
+  changePageSize(widget: WidgetData, size: number) {
+    this.ensurePagination(widget);
+    widget.pagination!.pageSize = Number(size);
+    widget.pagination!.currentPage = 1; // Reset to first page when changing page size
   }
 }

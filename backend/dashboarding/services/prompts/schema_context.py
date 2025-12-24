@@ -17,6 +17,26 @@ class SchemaContextBuilder:
     Field groups and descriptions aligned with usecase.md Section A.
     """
     
+    # Index descriptions - what each index covers and what it's used for
+    # This helps the LLM choose the right index based on user questions
+    INDEX_DESCRIPTIONS = {
+        'converse_lm_consumption_summary_reports_prod': (
+            "Module Consumption & Completion Data - This index tracks user learning progress, "
+            "module assignments, completions, and training consumption. It contains records of "
+            "users assigned to training modules, their completion status, completion dates, ratings, "
+            "and progress. Use this index for queries about: user completions, module completion rates, "
+            "assigned modules, training progress, user learning activity, module ratings, completion "
+            "statistics, and any questions about who completed what training and when."
+        ),
+        # Add more index descriptions here as you add new indices
+        # Example:
+        # 'sales_data': (
+        #     "Sales Data - This index contains sales transactions, revenue, customer purchases, "
+        #     "and sales performance metrics. Use for queries about: sales figures, revenue, "
+        #     "customer orders, sales trends, and product sales."
+        # ),
+    }
+    
     # Field descriptions for better LLM understanding - aligned with usecase.md Section A
     FIELD_DESCRIPTIONS = {
         # USER DIMENSIONS
@@ -187,11 +207,20 @@ class SchemaContextBuilder:
         """
         parts = []
         
-        # Header
+        # Header with index description
         index_id = schema.get('index_id', 'unknown')
         doc_count = schema.get('document_count', 0)
         parts.append(f"INDEX: {index_id}")
         parts.append(f"TOTAL RECORDS: {doc_count:,}")
+        
+        # Add index description if available
+        index_description = cls.INDEX_DESCRIPTIONS.get(index_id)
+        if index_description:
+            parts.append("")
+            parts.append("INDEX DESCRIPTION:")
+            parts.append("-" * 40)
+            parts.append(index_description)
+        
         parts.append("")
         
         # Fields section

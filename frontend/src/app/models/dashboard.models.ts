@@ -29,6 +29,11 @@ export interface DashboardItem {
     cols: number;
     rows: number;
   };
+  // Timeframe metadata for dynamic date ranges
+  timeframe_key?: string;  // e.g., "LAST_3_MONTHS", "THIS_QUARTER"
+  timezone?: string;       // e.g., "Asia/Kolkata" (default)
+  date_field?: string;     // e.g., "completed_date" (default)
+  date_mode?: string;      // e.g., "epoch_seconds" (default)
   created_at: string;
   updated_at: string;
 }

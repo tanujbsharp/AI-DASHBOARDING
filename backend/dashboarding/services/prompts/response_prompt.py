@@ -48,14 +48,24 @@ Generate a response for a KEY METRIC display.
 QUERY RESULTS:
 {query_results}
 
+🔴 CRITICAL: For completion rate queries:
+- If you see "scope: X.X% completion rate" in the aggregation results, use that EXACT formatted value
+- The completion rate is already calculated and formatted - DO NOT try to calculate it yourself
+- DO NOT reference "Buckets", "[object Object]", or raw aggregation structures
+- Simply state the completion rate percentage as shown in the formatted aggregation result
+
 REQUIREMENTS:
 - Lead with the main number prominently
 - Explain what the number represents
 - Add context (time period, filters applied)
 - Format large numbers with commas
+- For completion rates, use the formatted percentage from aggregations (e.g., "scope: 100.0% completion rate")
 
 EXAMPLE FORMAT:
 "Found 1,234 unique users who completed training in November 2024."
+
+For completion rate:
+"The completion rate for [module name] is X.X% (Y completed out of Z assigned)."
 """,
 
         ResponseType.MULTI_KPI: """
@@ -293,26 +303,77 @@ EXAMPLE FORMAT:
             # Terms aggregation (buckets) or Date histogram (buckets)
             if 'buckets' in value:
                 buckets = value['buckets']
-                bucket_count = len(buckets)
+                # Handle both list and dict formats for buckets
+                is_dict_format = isinstance(buckets, dict)
+                if is_dict_format:
+                    # If buckets is a dict, preserve the keys and convert to list
+                    # For completion rate queries, look for "all" bucket
+                    bucket_list = list(buckets.values())
+                    bucket_keys = list(buckets.keys())
+                elif isinstance(buckets, list):
+                    # If buckets is a list, use it directly
+                    bucket_list = buckets
+                    bucket_keys = [b.get('key') or b.get('key_as_string') for b in bucket_list if isinstance(b, dict)]
+                else:
+                    bucket_list = []
+                    bucket_keys = []
+                
+                bucket_count = len(bucket_list)
                 if bucket_count == 0:
                     return f"{name}: 0 categories"
                 
+                # SPECIAL HANDLING: Check if this is a completion rate KPI (scope.buckets.all.completion_rate.value)
+                # This must be checked BEFORE date histogram check
+                if name == 'scope' and bucket_list:
+                    all_bucket = None
+                    if is_dict_format and 'all' in buckets:
+                        # Direct access to "all" bucket when buckets is a dict
+                        all_bucket = buckets['all']
+                    else:
+                        # Find "all" bucket in list format
+                        for i, b in enumerate(bucket_list):
+                            if isinstance(b, dict):
+                                bucket_key = b.get('key') or b.get('key_as_string') or (bucket_keys[i] if i < len(bucket_keys) else None)
+                                if bucket_key == 'all' or (len(bucket_list) == 1 and 'completion_rate' in b):
+                                    all_bucket = b
+                                    break
+                    
+                    if all_bucket and isinstance(all_bucket, dict):
+                        # Look for completion_rate value
+                        completion_rate = all_bucket.get('completion_rate', {})
+                        if isinstance(completion_rate, dict) and 'value' in completion_rate:
+                            rate_value = completion_rate['value']
+                            # Also get assigned and completed counts for context
+                            assigned = all_bucket.get('assigned', {})
+                            assigned_count = assigned.get('value', 0) if isinstance(assigned, dict) else 0
+                            completed = all_bucket.get('completed', {})
+                            completed_count_agg = completed.get('completed_count', {}) if isinstance(completed, dict) else {}
+                            completed_count = completed_count_agg.get('value', 0) if isinstance(completed_count_agg, dict) else 0
+                            
+                            # Return formatted completion rate - this is what the LLM will see
+                            formatted = f"{name}: {rate_value:.1f}% completion rate ({int(completed_count)} completed out of {int(assigned_count)} assigned)"
+                            return formatted
+                
                 # Check if this is a date histogram (has key_as_string or date-like keys)
+                # Only check first few buckets (up to 3)
+                sample_buckets = bucket_list[:3] if len(bucket_list) >= 3 else bucket_list
                 is_date_histogram = any(
-                    'key_as_string' in b or 
-                    (isinstance(b.get('key'), (int, float)) and b.get('key', 0) > 1e8) or
-                    (isinstance(b.get('key'), str) and ('-' in str(b.get('key', '')) or len(str(b.get('key', ''))) == 10))
-                    for b in buckets[:3]  # Check first few buckets
+                    isinstance(b, dict) and (
+                        'key_as_string' in b or 
+                        (isinstance(b.get('key'), (int, float)) and b.get('key', 0) > 1e8) or
+                        (isinstance(b.get('key'), str) and ('-' in str(b.get('key', '')) or len(str(b.get('key', ''))) == 10))
+                    )
+                    for b in sample_buckets
                 )
                 
                 # For date histograms, show ALL buckets with activity (non-zero counts)
                 # For other aggregations, show top 5
                 if is_date_histogram:
                     # Show all buckets with activity (doc_count > 0)
-                    active_buckets = [b for b in buckets if b.get('doc_count', 0) > 0]
+                    active_buckets = [b for b in bucket_list if isinstance(b, dict) and b.get('doc_count', 0) > 0]
                     if not active_buckets:
                         # All buckets are zero, but show a few to indicate the range
-                        active_buckets = buckets[:3]
+                        active_buckets = bucket_list[:3]
                     
                     bucket_strs = []
                     for b in active_buckets:
@@ -334,7 +395,7 @@ EXAMPLE FORMAT:
                     return result
                 else:
                     # Regular terms aggregation - show top 5 buckets
-                    top_buckets = buckets[:5]
+                    top_buckets = bucket_list[:5]
                     bucket_strs = []
                     for b in top_buckets:
                         key = b.get('key', '?')

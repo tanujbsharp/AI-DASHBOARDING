@@ -231,6 +231,10 @@ export class AddToDashboardModalComponent {
     index_id?: string;
     query_payload: Record<string, any>;
     render_config: DashboardItem['render_config'];
+    timeframe_key?: string;
+    timezone?: string;
+    date_field?: string;
+    date_mode?: string;
   };
   
   @Output() saved = new EventEmitter<DashboardItem>();
@@ -279,6 +283,11 @@ export class AddToDashboardModalComponent {
       index_id: this.widgetData.index_id,
       query_payload: this.widgetData.query_payload,
       render_config: this.widgetData.render_config,
+      // Include timeframe metadata if available
+      timeframe_key: this.widgetData.timeframe_key,
+      timezone: this.widgetData.timezone,
+      date_field: this.widgetData.date_field,
+      date_mode: this.widgetData.date_mode,
       layout: {
         x: 0,
         y: maxY,

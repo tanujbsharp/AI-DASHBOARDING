@@ -26,6 +26,10 @@ interface DashboardWidgetPayload {
   index_id?: string;
   query_payload: Record<string, any>;
   render_config: DashboardItem['render_config'];
+  timeframe_key?: string;
+  timezone?: string;
+  date_field?: string;
+  date_mode?: string;
 }
 
 @Component({
@@ -1701,13 +1705,45 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
     const skip = ['_id', '_score'];
     let keys = Object.keys(row).filter(k => !skip.includes(k));
     
-    if (preferredFields?.length) {
-      // Use preferred fields order, but only include ones that exist
-      const available = preferredFields.filter(f => keys.includes(f));
-      return available;
+    // CRITICAL: Always prioritize first_name, last_name, email_addr at the start
+    const priorityFields = ['first_name', 'last_name', 'email_addr'];
+    const orderedKeys: string[] = [];
+    const seenFields = new Set<string>();
+    
+    // First, add priority fields if they exist
+    for (const priorityField of priorityFields) {
+      if (keys.includes(priorityField) && !seenFields.has(priorityField)) {
+        orderedKeys.push(priorityField);
+        seenFields.add(priorityField);
+      }
     }
     
-    return keys.slice(0, 8); // Limit to 8 columns for readability
+    if (preferredFields?.length) {
+      // Then add preferred fields (excluding priority fields already added)
+      for (const field of preferredFields) {
+        if (keys.includes(field) && !seenFields.has(field)) {
+          orderedKeys.push(field);
+          seenFields.add(field);
+        }
+      }
+    } else {
+      // If no preferred fields, add remaining keys in their original order
+      for (const key of keys) {
+        if (!seenFields.has(key)) {
+          orderedKeys.push(key);
+          seenFields.add(key);
+        }
+      }
+    }
+    
+    // Add any remaining keys that weren't in priority or preferred
+    for (const key of keys) {
+      if (!seenFields.has(key)) {
+        orderedKeys.push(key);
+      }
+    }
+    
+    return orderedKeys.slice(0, 8); // Limit to 8 columns for readability
   }
 
   private tryFormatIsoDate(value: string): string | null {
@@ -2312,6 +2348,11 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
       index_id: response.index_id,
       query_payload: response.query,
       render_config: this.buildRenderConfig(response),
+      // Include timeframe metadata if available
+      timeframe_key: response.timeframe_key,
+      timezone: response.timezone,
+      date_field: response.date_field,
+      date_mode: response.date_mode,
     };
     this.showAddToDashboardModal = true;
   }

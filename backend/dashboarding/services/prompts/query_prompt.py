@@ -109,6 +109,7 @@ STATUS CODE MAPPINGS
     - "published modules" / "live" → module_status = 0
     - "draft modules" / "unpublished" → module_status = 2
     - "deleted modules" / "retired" → module_status = 1
+    - DEFAULT RULE: Unless the user explicitly requests "draft", "deleted", "retired", "removed", "archived", or "unpublished" modules, ALWAYS add {"term": {"module_status": 0}} for every module / training / course query (counts, assignments, completions, lists, breakdowns, charts).
 
   Completion Status:
     - "completed" / "finished" / "done" / "passed" → completed_status = 1
@@ -133,8 +134,9 @@ CARDINALITY RULES (Which Field to Use for Unique Counts)
   Regular Counts (COUNT ALL RECORDS, NOT UNIQUE ENTITIES):
     - "how many completions" / "total completions" / "total module completions" 
       → COUNT ALL RECORDS with completed_status=1 (NOT cardinality on mid!)
-      → Use: {"value_count": {"field": "_id"}} OR just count matching records
-      → DO NOT use {"cardinality": {"field": "mid"}} - that counts unique modules!
+      → Use: {{"filter": {{"match_all": {{}}}}} to get doc_count (safer than value_count on _id)
+      → DO NOT use {{"cardinality": {{"field": "mid"}}}} - that counts unique modules!
+      → DO NOT use {{"value_count": {{"field": "_id"}}}} - _id field causes errors in OpenSearch!
     - "how many assigned" → count records with assigned_status=0 AND user_status=5
     
   🔴 CRITICAL DISTINCTION:
@@ -143,10 +145,121 @@ CARDINALITY RULES (Which Field to Use for Unique Counts)
     - "total module completions" = count ALL records, NOT unique modules!
 
   Averages:
-    - "avg completion %" → average of complete_percentage
+    - "avg completion %" → completion rate computed from counts (completed / assigned)
     - "avg estimated time" → average of estd_time
     - "avg ratings" → average of ratings
   - "avg points" → average of module_points
+
+════════ SECTION: RATINGS + AVERAGE CALCULATIONS (STRICT) ════════
+
+  A) What counts as a rating?
+     - A "rating event" is a document where:
+       • completed_status = 1
+       • ratings exists (and ratings > 0 if 0 means "not rated")
+       • OPTIONAL: module_status = 0 if the question says "published modules only"
+       • Time filters MUST apply to completed_date (not published_date)
+     - Never compute rating metrics using documents where completed_status != 1.
+     - Never include missing ratings in the average.
+
+  B) Basic formula:
+     • Average = sum(ratings) / count(ratings)
+       → In OpenSearch use: {"avg": {"field": "ratings"}} AFTER filtering to rating events.
+
+  C) "How many modules did person X rate 5 (or >=4)?"
+     - Interpretation: count UNIQUE modules (mid) that the user rated in that range.
+     - Filters: uid = X + rating event filters + completed_date range (if provided) + ratings range (>=4 or =5)
+     - Result: cardinality(mid) as "modules_rated_count"
+     - If user asks "how many ratings" (not modules), return doc_count/value_count instead.
+
+  D) "Which modules did person X rate >=4?"
+     - Same filters as (C).
+     - Return UNIQUE modules (terms agg on mid) with top_hits for module_name.
+     - Do NOT return all rating records; return unique modules only.
+
+  E) "Average rating person X has left?"
+     - Filters: uid = X + rating event filters + completed_date range (if provided)
+     - Agg: avg(ratings)
+     - Return single number.
+
+  F) "Average rating of module M?"
+     - Filters: mid = M + rating event filters + completed_date range (if provided)
+     - Agg: avg(ratings)
+     - Return single number.
+
+  G) "Average rating of multiple modules"
+     - Two interpretations (pick based on wording):
+       1) Weighted average across all ratings (DEFAULT)
+          Filter mid IN [...] + rating event filters + completed_date range
+          Agg: avg(ratings)
+       2) Unweighted average of per-module averages (ONLY if user says "average of module averages" / "treat each module equally")
+          terms agg by mid -> avg(ratings) per module -> avg_bucket over those per-module avgs.
+
+  H) "On average how many modules have been completed"
+     - This is a completion RATE, not a rating.
+     - Default interpretation: completion_rate = completed_records / assigned_records
+       • assigned_records = documents with assigned_status = 0 AND module_status = 0 (plus timeframe if provided)
+       • completed_records = documents with completed_status = 1 AND assigned_status = 0 AND module_status = 0 (plus timeframe if provided)
+     - If user says "per user": unique modules completed per uid (cardinality mid per uid) then avg_bucket.
+     - If user says "per month": date_histogram by month (completed_date) and avg monthly count.
+
+════════ SECTION: COMPLETION PERCENTAGE / AVERAGE COMPLETION % (STRICT) ════════
+
+  IMPORTANT DEFINITIONS
+  - "complete_percentage" is a stored per-user-per-module progress value. Return it as-is when user asks for that record’s progress. NEVER average this field.
+  - "completion percentage" / "average completion %" (overall) = completion rate computed from counts: completed_records / assigned_records * 100.
+
+  Terminology:
+  - "completion percentage" (overall) → completion rate (completed / assigned * 100)
+  - "avg completion %" → same completion rate formula from counts
+  - "progress percentage"/"completion % for this user on this module" → use complete_percentage field as stored.
+
+  I1) Overall completion rate for module X (no user/cohort specified)
+      - assigned = count records where mid = X, assigned_status = 0, module_status = 0
+      - completed = count records where mid = X, assigned_status = 0, completed_status = 1, module_status = 0
+      - completion_rate = completed / assigned * 100 (return percentage + raw counts)
+      - Timeframe: apply to completed_date for numerator only. Do NOT time-bound assigned unless an assignment date field exists.
+        If assignment date missing, add limitation text: "Assignments cannot be perfectly time-bounded without an assignment date field; completions are time-bounded by completed_date."
+      - If user asks for "incomplete rate", compute incomplete = assigned - completed and incomplete / assigned * 100.
+
+  I2) Completion rate for a single user (uid/email/name)
+      - CRITICAL: To find the user, determine if input is email or name:
+        * If input contains "@" → it's an EMAIL → use {{"match": {{"email_addr": {{"query": "value"}}}}}}
+        * If input is 2+ words (e.g., "tanuj sadasivam") → it's a FULL NAME → use:
+          {{"bool": {{
+            "must": [
+              {{"match": {{"first_name": {{"query": "first_word", "operator": "and"}}}}}},
+              {{"match": {{"last_name": {{"query": "remaining_words", "operator": "and"}}}}}}
+            ]
+          }}}}
+        * If input is 1 word (e.g., "tanuj") → it's a SINGLE NAME → use:
+          {{"bool": {{
+            "should": [
+              {{"match": {{"first_name": {{"query": "value", "fuzziness": "AUTO"}}}}}},
+              {{"match": {{"last_name": {{"query": "value", "fuzziness": "AUTO"}}}}}}
+            ],
+            "minimum_should_match": 1
+          }}}}
+      - ⚠️ NEVER use module_name to search for user names/emails!
+      - assigned_user = count records: user matched + assigned_status = 0, module_status = 0
+      - completed_user = count records: user matched + assigned_status = 0, completed_status = 1, module_status = 0
+      - completion_rate_user = completed_user / assigned_user * 100 (return percentage + raw counts)
+      - If user asks "completion % for module Y for user X": this is NOT an average. Return record-level status:
+          • completed_status = 1 → "Completed (100%)"
+          • assigned_status = 0 but not completed → return complete_percentage if present, else "In progress (0%)"
+          • No record → "Not assigned / no record"
+
+  I3) Cohort completion rate (team/region/list of users)
+      - assigned_cohort = count records: mid = X, assigned_status = 0, module_status = 0 + cohort filters
+      - completed_cohort = count records: mid = X, assigned_status = 0, completed_status = 1, module_status = 0 + cohort filters
+      - completion_rate_cohort = completed_cohort / assigned_cohort * 100 (return percentage + raw counts)
+      - Apply timeframe to completed_date for numerator only; mention assignment-date limitation when applicable.
+      - Use UNIQUE USERS only when user explicitly asks "% of users completed"; otherwise record-based counts are acceptable.
+
+  I4) Disambiguation rules:
+      - Query mentions "user <id/email/name>" → use I2.
+      - Query mentions regions/teams/segments ("for these users", "for South region") → use I3.
+      - Query mentions only module → default to I1.
+      - Query mentions "progress", "complete_percentage", "how far along" → fetch complete_percentage field (no averaging).
 
 ══════════════════════════════════════════════════════════════════════════════
 UNIQUE vs ALL-RECORD OUTPUT (Deduping Rules)
@@ -236,7 +349,7 @@ UNIQUE vs ALL-RECORD OUTPUT (Deduping Rules)
       • Coaches → coach_email_addr
       • Managers → manager_email_addr
 
-  - "How many completions" → COUNT RECORDS (value_count on _id or hits.total)
+  - "How many completions" → COUNT RECORDS (use filter aggregation with match_all to get doc_count, NOT value_count on _id)
     "How many unique learners" → cardinality on uid
     "How many unique modules" → cardinality on mid
     "How many unique courses" → cardinality on cmid
@@ -373,6 +486,10 @@ Examples that require aggregation:
 - "who didn't complete any training this year"
 - "users who haven't finished any module in the past 30 days"
 
+══════════════════════════════════════════════════════════════════════════════
+INDEX INFORMATION & SCHEMA
+══════════════════════════════════════════════════════════════════════════════
+
 {schema_context}
 
 {date_context}
@@ -505,10 +622,41 @@ FILTER BUILD RULES (Section F):
     - These are METRIC TERMS, not person names!
     - Adding name/email filters for these will exclude all users and break the query!
 
+🔴🔴🔴 CRITICAL: FOR USER COMPLETION RATE QUERIES (I2 pattern):
+  When the user asks for "completion rate" or "completion %" FOR A SPECIFIC USER/PERSON:
+  - DO NOT use module_name to search for the user's name!
+  - DO NOT use match_phrase on module_name for person names!
+  - INSTEAD, determine if the input is:
+    1. EMAIL (contains "@") → use {{"match": {{"email_addr": {{"query": "value"}}}}}}
+    2. FULL NAME (2+ words like "tanuj sadasivam") → use BOTH first_name AND last_name:
+       {{"bool": {{
+         "must": [
+           {{"match": {{"first_name": {{"query": "first_word", "operator": "and"}}}}}},
+           {{"match": {{"last_name": {{"query": "remaining_words", "operator": "and"}}}}}}
+         ]
+       }}}}
+    3. SINGLE NAME (1 word like "tanuj") → use first_name OR last_name:
+       {{"bool": {{
+         "should": [
+           {{"match": {{"first_name": {{"query": "value", "fuzziness": "AUTO"}}}}}},
+           {{"match": {{"last_name": {{"query": "value", "fuzziness": "AUTO"}}}}}}
+         ],
+         "minimum_should_match": 1
+       }}}}
+  
+  Examples for USER COMPLETION RATE queries:
+    * "what is tanuj's completion rate" → SINGLE NAME → match first_name OR last_name (NOT module_name!)
+    * "completion rate of tanuj sadasivam" → FULL NAME → match first_name AND last_name (NOT module_name!)
+    * "tanuj@example.com completion rate" → EMAIL → match email_addr (NOT module_name!)
+    * "completion rate for john" → SINGLE NAME → match first_name OR last_name (NOT module_name!)
+  
+  ⚠️ NEVER use module_name when filtering by user name/email for completion rate queries!
+
 - For module_name: ALWAYS use match_phrase (not term) for fuzzy matching:
   {{"match_phrase": {{"module_name": {{"query": "module name here", "slop": 2}}}}}}
-- Use fuzzy match for human-provided names if minor spelling errors
-- Don't silently change meaning (if user asks "completed", don't include incomplete)
+  - BUT: ONLY use module_name for ACTUAL MODULE NAMES, not person names!
+  - Use fuzzy match for human-provided names if minor spelling errors
+  - Don't silently change meaning (if user asks "completed", don't include incomplete)
 
 OUTPUT SHAPING (Section G):
 - "how many / what is the average / what %" → aggregated metrics
@@ -544,7 +692,8 @@ MANDATORY FILTERS TO INCLUDE:
 🔴 CRITICAL DISTINCTION - "total completions" vs "unique modules":
   - "total completions" / "total module completions" / "how many completions"
     → COUNT ALL RECORDS (multiple users can complete same module!)
-    → Use: {{"value_count": {{"field": "_id"}}}} OR get total from query result
+    → Use: {{"filter": {{"match_all": {{}}}}} to get doc_count (safer than value_count on _id)
+    → DO NOT use {{"value_count": {{"field": "_id"}}}} - _id field causes errors in OpenSearch!
     → DO NOT use cardinality on mid (that counts unique modules, not total records!)
   
   - "unique modules completed" / "how many unique modules" / "how many modules has [user] completed"
@@ -592,7 +741,8 @@ Query pattern for "total completions" (COUNT ALL RECORDS):
     }}
   }},
   "aggs": {{
-    "total_completions": {{ "value_count": {{ "field": "_id" }} }}
+    "total_completions": {{ "filter": {{ "match_all": {{}} }} }}
+      // doc_count will give the total number of records
   }}
 }}
 
@@ -659,6 +809,18 @@ MANDATORY FILTERS FOR COMPLETION/ASSIGNMENT QUERIES:
   - For completion/assignment queries: {{"term": {{"assigned_status": 0}}}} ← Assigned records only!
   - If asking about completions: {{"term": {{"completed_status": 1}}}}
 
+🔴 CRITICAL - COLUMN ORDER:
+  - ALWAYS place user identification fields at the START: first_name, last_name, email_addr (in that order)
+  - These three fields should ALWAYS be grouped together at the beginning of the "_source" array when present
+  - Example: If query includes user fields, "_source" should start with: ["first_name", "last_name", "email_addr", ...]
+  
+  - If the user message mentions "Show columns in this order:" or lists specific columns with numbers (1., 2., 3., etc.),
+    you MUST respect that EXACT order AFTER the priority fields (first_name, last_name, email_addr).
+  - The "_source" array should be: [first_name, last_name, email_addr] + [user-specified fields in order] + [any other fields]
+  - DO NOT add extra fields that weren't requested.
+  - Example: If user says "Show columns in this order: 1. email_addr, 2. first_name, 3. module_name",
+    then "_source" should be: ["first_name", "last_name", "email_addr", "module_name"] (priority fields first, then user order).
+
 CRITICAL - When to use COLLAPSE for unique results:
 
 USE COLLAPSE when asking about ENTITY ATTRIBUTES (one record per entity):
@@ -680,7 +842,7 @@ Query pattern (with collapse for unique users):
 {{
   "size": 50,
   "collapse": {{"field": "uid"}},
-  "_source": ["email_addr", "first_name", "module_name", "city", "completed_status"],
+  "_source": ["first_name", "last_name", "email_addr", "module_name", "city", "completed_status"],
   "query": {{
     "bool": {{
       "filter": [
@@ -694,7 +856,7 @@ Query pattern (with collapse for unique users):
 Query pattern (without collapse for activities/completions):
 {{
   "size": 50,
-  "_source": ["email_addr", "first_name", "module_name", "city", "completed_status"],
+  "_source": ["first_name", "last_name", "email_addr", "module_name", "city", "completed_status"],
   "query": {{
     "bool": {{
       "filter": [
@@ -905,6 +1067,235 @@ Query pattern for completions by city:
   5. USE bucket_sort to sort by completion_rate after calculating it
   6. Group by "mid" (module ID), not "module_name" (more stable)
   7. NEVER add name/email filters for "completion", "completions", or "completion rate"
+
+  Module-specific completion rate (single module KPI):
+  {{
+    "size": 0,
+    "query": {{
+      "bool": {{
+        "filter": [
+          {{"term": {{"user_status": 5}}}},
+          {{"term": {{"assigned_status": 0}}}},
+          {{"term": {{"module_status": 0}}}},
+          {{"term": {{"cmid": 1}}}},
+          {{
+            "match_phrase": {{
+              "module_name": {{
+                "query": "MODULE_NAME_HERE",
+                "slop": 2
+              }}
+            }}
+          }}
+        ]
+      }}
+    }},
+    "aggs": {{
+      "scope": {{
+        "filters": {{
+          "filters": {{
+            "all": {{"match_all": {{}}}}
+          }}
+        }},
+        "aggs": {{
+          "assigned": {{
+            "value_count": {{"field": "uid"}}
+          }},
+          "completed": {{
+            "filter": {{"term": {{"completed_status": 1}}}},
+            "aggs": {{
+              "completed_count": {{
+                "value_count": {{"field": "uid"}}
+              }}
+            }}
+          }},
+          "completion_rate": {{
+            "bucket_script": {{
+              "buckets_path": {{
+                "completed": "completed>completed_count",
+                "assigned": "assigned"
+              }},
+              "script": "params.assigned > 0 ? (params.completed / params.assigned) * 100 : 0"
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+  
+  ⚠️ CRITICAL: 
+  - Put assigned_status: 0 in the main query filter (defines denominator)
+  - DO NOT put completed_status: 1 in the main query filter (only in aggregation)
+  - DO NOT put ratings filters in the main query filter
+  - Use "scope" filters aggregation (multi-bucket) with named "all" bucket (match_all)
+  - bucket_script MUST be inside a filters aggregation (multi-bucket), not a single-bucket filter aggregation
+  - Use "assigned" value_count on uid for assigned count (direct aggregation, not inside filter)
+  - Use "completed" filter aggregation with completed_status: 1, containing "completed_count" value_count on uid
+  - bucket_script references: completed: "completed>completed_count" and assigned: "assigned"
+  - aggregations.scope.buckets.all.assigned.value = assigned count (denominator)
+  - aggregations.scope.buckets.all.completed.completed_count.value = completed count (numerator)
+  - aggregations.scope.buckets.all.completion_rate.value = completion rate %
+
+  🔸 Time range handling for module completion rate:
+     - ONLY apply completed_date range inside completed filter aggregation (numerator).
+     - Never time-bound the main query or assigned bucket unless an assignment date field exists.
+     - If no timeframe is provided, omit the range clause entirely.
+
+  User-specific completion rate (single learner KPI):
+  
+  🔴 CRITICAL: Determine if user input is EMAIL or NAME:
+  
+  If EMAIL (contains "@"):
+    {{"term": {{"email_addr": "user@example.com"}}}}
+  
+  If FULL NAME (2+ words like "tanuj sadasivam"):
+    {{"bool": {{
+      "must": [
+        {{"match": {{"first_name": {{"query": "tanuj", "operator": "and"}}}}}},
+        {{"match": {{"last_name": {{"query": "sadasivam", "operator": "and"}}}}}}
+      ]
+    }}}}
+  
+  If SINGLE NAME (1 word like "tanuj"):
+    {{"bool": {{
+      "should": [
+        {{"match": {{"first_name": {{"query": "tanuj", "fuzziness": "AUTO"}}}}}},
+        {{"match": {{"last_name": {{"query": "tanuj", "fuzziness": "AUTO"}}}}}}
+      ],
+      "minimum_should_match": 1
+    }}}}
+  
+  ⚠️ NEVER use module_name for user names/emails!
+  
+  Example query structure:
+  {{
+    "size": 0,
+    "query": {{
+      "bool": {{
+        "filter": [
+          {{"term": {{"user_status": 5}}}},
+          {{"term": {{"assigned_status": 0}}}},
+          {{"term": {{"module_status": 0}}}},
+          {{"term": {{"cmid": 1}}}},
+          // Use ONE of the patterns above based on user input (email, full name, or single name)
+          // Example for single name "tanuj":
+          {{"bool": {{
+            "should": [
+              {{"match": {{"first_name": {{"query": "tanuj", "fuzziness": "AUTO"}}}}}},
+              {{"match": {{"last_name": {{"query": "tanuj", "fuzziness": "AUTO"}}}}}}
+            ],
+            "minimum_should_match": 1
+          }}}}
+        ]
+      }}
+    }},
+    "aggs": {{
+      "completion_scope": {{
+        "filters": {{
+          "filters": {{
+            "all_assigned": {{"match_all": {{}}}}
+          }}
+        }},
+        "aggs": {{
+          "total_assigned": {{
+            "value_count": {{"field": "uid"}}
+          }},
+          "completion_stats": {{
+            "filter": {{"term": {{"completed_status": 1}}}},
+            "aggs": {{
+              "completed_count": {{
+                "value_count": {{"field": "uid"}}
+              }}
+            }}
+          }},
+          "completion_rate": {{
+            "bucket_script": {{
+              "buckets_path": {{
+                "completed": "completion_stats>completed_count",
+                "total": "total_assigned"
+              }},
+              "script": "params.total > 0 ? (params.completed * 100.0 / params.total) : 0"
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+  
+  ⚠️ CRITICAL: 
+  - Put assigned_status: 0 in the main query filter (defines denominator)
+  - DO NOT put completed_status: 1 in the main query filter (only in aggregation)
+  - DO NOT put ratings filters in the main query filter
+  - Use "completion_scope" filters aggregation (multi-bucket) with named "all_assigned" bucket (match_all)
+  - bucket_script MUST be inside a filters aggregation (multi-bucket), not a single-bucket filter aggregation
+  - Use "total_assigned" value_count on uid for assigned count
+  - Use "completion_stats" filter aggregation with completed_status: 1, containing "completed_count" value_count on uid
+  - bucket_script references: completed: "completion_stats>completed_count" and total: "total_assigned"
+
+  🔸 Time range handling for user completion rate:
+     - Add completed_date range ONLY inside completed filter aggregation (numerator).
+     - Keep the main query and assigned bucket counting all assigned records (no assignment date filter available).
+     - When timeframe exists ("last quarter", "in 2024"), convert it to {{"range": {{"completed_date": {{"gte": START_TS, "lt": END_TS}}}}}.
+  
+  Per-user completion rate (completion rate for each user):
+  {{
+    "size": 0,
+    "query": {{
+      "bool": {{
+        "filter": [
+          {{"term": {{"user_status": 5}}}},
+          {{"term": {{"assigned_status": 0}}}},
+          {{"term": {{"module_status": 0}}}},
+          {{"term": {{"cmid": 1}}}}
+        ]
+      }}
+    }},
+    "aggs": {{
+      "by_user": {{
+        "terms": {{"field": "uid", "size": 10000}},
+        "aggs": {{
+          "completion_scope": {{
+            "filters": {{
+              "filters": {{
+                "all_assigned": {{"match_all": {{}}}}
+              }}
+            }},
+            "aggs": {{
+              "total_assigned": {{
+                "value_count": {{"field": "uid"}}
+              }},
+              "completion_stats": {{
+                "filter": {{"term": {{"completed_status": 1}}}},
+                "aggs": {{
+                  "completed_count": {{
+                    "value_count": {{"field": "uid"}}
+                  }}
+                }}
+              }},
+              "rate": {{
+                "bucket_script": {{
+                  "buckets_path": {{
+                    "completed": "completion_stats>completed_count",
+                    "total": "total_assigned"
+                  }},
+                  "script": "params.total > 0 ? (params.completed * 100.0 / params.total) : 0"
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+  
+  ⚠️ CRITICAL: 
+  - Put assigned_status: 0 in the main query filter (defines denominator for all users)
+  - DO NOT put completed_status: 1 in the main query filter (only in aggregation)
+  - DO NOT put ratings filters in the main query filter
+  - Use "completion_scope" filters aggregation (multi-bucket) with named "all_assigned" bucket (match_all) inside each user bucket
+  - bucket_script MUST be inside a filters aggregation (multi-bucket), not a single-bucket filter aggregation
+  - Use "total_assigned" value_count on uid for assigned count
+  - Use "completion_stats" filter aggregation with completed_status: 1, containing "completed_count" value_count on uid
+  - Each user bucket: completion_scope.buckets.all_assigned.total_assigned.value = assigned count, completion_scope.buckets.all_assigned.completion_stats.completed_count.value = completed count
 """,
 
         ResponseType.COMPARISON: """
@@ -1106,6 +1497,19 @@ The system will provide schema documentation directly.""",
         has_time_range = time_period and not time_period.is_lifetime
         
         if has_havent_completed and has_time_range:
+            # Check if this is a relative timeframe for date math
+            from dashboarding.services.time_handler import TimeframeResolver
+            timeframe_key = TimeframeResolver.extract_timeframe_key(user_message)
+            date_math = None
+            if timeframe_key:
+                date_math = TimeframeResolver._get_date_math_expressions(timeframe_key)
+            
+            time_range_str = ""
+            if date_math:
+                time_range_str = f'Use OpenSearch date math: {{"gte": "{date_math["gte"]}", "lt": "{date_math["lt"]}"}}'
+            else:
+                time_range_str = f'Use epoch timestamps: {{"gte": {time_period.start_timestamp}, "lt": {time_period.end_timestamp}}}'
+            
             parts.append(f"""
 🔴🔴🔴 CRITICAL: This is a "haven't completed in time range" query!
 You MUST use the aggregation pattern from the system prompt (pattern #1 in DATE FIELD RULES).
@@ -1119,13 +1523,36 @@ Required structure:
 - aggs.users.aggs.only_inactive_users: bucket_selector with script "params.assignedCount > 0 && params.recentCompletedCount == 0"
 - aggs.users.aggs.user_info: top_hits to get user details
 
-Time range: {time_period.start_timestamp} to {time_period.end_timestamp}
+Time range: {time_range_str}
 Use completed_date for the time range in recent_completions filter.""")
         
         # Add time period context if detected
         if time_period and not time_period.is_lifetime:
             if not (has_havent_completed and has_time_range):  # Don't duplicate if already added above
-                parts.append(f"""
+                # Check if this is a relative timeframe that should use date math
+                from dashboarding.services.time_handler import TimeframeResolver
+                timeframe_key = TimeframeResolver.extract_timeframe_key(user_message)
+                
+                if timeframe_key:
+                    # Use date math expressions for relative timeframes
+                    date_math = TimeframeResolver._get_date_math_expressions(timeframe_key)
+                    if date_math:
+                        parts.append(f"""
+TIME FILTER DETECTED: {time_period.description} (relative timeframe)
+Suggested date field: {time_field} (but determine the correct date field based on the query context - see DATE FIELD RULES)
+Use OpenSearch date math expressions for dynamic date calculation:
+{{"range": {{"<DATE_FIELD>": {{"gte": "{date_math['gte']}", "lt": "{date_math['lt']}"}}}}}}
+This will calculate the date range dynamically at query time (e.g., "now-3M/M" means start of month 3 months ago).""")
+                    else:
+                        # Fallback to epoch if date math not available
+                        parts.append(f"""
+TIME FILTER DETECTED: {time_period.description}
+Suggested date field: {time_field} (but determine the correct date field based on the query context - see DATE FIELD RULES)
+Use this date range in your query:
+{{"range": {{"<DATE_FIELD>": {{"gte": {time_period.start_timestamp}, "lt": {time_period.end_timestamp}}}}}}}""")
+                else:
+                    # Absolute date - use epoch timestamps
+                    parts.append(f"""
 TIME FILTER DETECTED: {time_period.description}
 Suggested date field: {time_field} (but determine the correct date field based on the query context - see DATE FIELD RULES)
 Use this date range in your query:

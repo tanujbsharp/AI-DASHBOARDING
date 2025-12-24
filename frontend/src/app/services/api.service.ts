@@ -27,6 +27,10 @@ export type ResponseType =
   | 'text_response';
 
 export interface ChatResponse {
+  timeframe_key?: string;
+  timezone?: string;
+  date_field?: string;
+  date_mode?: string;
   type: 'clarification' | 'query' | 'summary' | 'message' | 'error';
   message: string;
   index_id?: string;
@@ -109,11 +113,23 @@ export class ApiService {
     return this.http.get<{ schemas: Record<string, IndexSchema>; count: number }>(`${this.baseUrl}/schemas/`);
   }
 
-  executeQuery(indexId: string, query: Record<string, any>, size?: number): Observable<ChatResponse['query_result']> {
+  executeQuery(
+    indexId: string,
+    query: Record<string, any>,
+    size?: number,
+    timeframeKey?: string,
+    timezone?: string,
+    dateField?: string,
+    dateMode?: string
+  ): Observable<ChatResponse['query_result']> {
     return this.http.post<ChatResponse['query_result']>(`${this.baseUrl}/query/execute/`, {
       index_id: indexId,
       query,
       ...(size !== undefined ? { size } : {}),
+      ...(timeframeKey ? { timeframe_key: timeframeKey } : {}),
+      ...(timezone ? { timezone } : {}),
+      ...(dateField ? { date_field: dateField } : {}),
+      ...(dateMode ? { date_mode: dateMode } : {}),
     });
   }
 
