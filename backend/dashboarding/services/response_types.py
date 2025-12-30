@@ -158,82 +158,78 @@ class ResponseTypeDetector:
                 r'\bwho\s+hasn\'t\b',
                 r'\bwho\s+haven\'t\b',
                 r'\busers?\s+who\b',
-            ],
-            'response_type': ResponseType.TABLE,
-            'priority': 12
-        },
-        
-        # 4) LINE_CHART patterns - TREND / TIME SERIES
-        'line_chart': {
-            'patterns': [
-                r'\btrend\b',
-                r'\bover\s+time\b',
-                r'\bmonth\s+by\s+month\b',
-                r'\bweek\s+by\s+week\b',
-                r'\bday\s+by\s+day\b',
-                r'\bprogression\b',
-                r'\bgrowth\b',
-                r'\bhistory\b',
-                r'\btime\s+series\b',
-                r'\bweekly\s+',
-                r'\bmonthly\s+',
-                r'\bdaily\s+',
-            ],
-            'response_type': ResponseType.LINE_CHART,
-            'priority': 10
-        },
-        
-        # Pie chart patterns (subset of breakdown)
-        'pie_chart': {
-            'patterns': [
-                r'\bpercentage\s+breakdown\b',
-                r'\bshare\s+of\b',
-                r'\bproportion\b',
-                r'\bpie\s+chart\b',
-                r'\bdistribution\s+of\b',
-            ],
-            'response_type': ResponseType.PIE_CHART,
-            'priority': 9
-        },
-        
-        # 3) BAR_CHART patterns - BREAKDOWN / GROUP BY
-        'bar_chart': {
-            'patterns': [
-                # Explicit chart/graph requests
-                r'\bgraph\s+of\b',
-                r'\bchart\s+of\b',
-                r'\bgraph\s+(of|showing|for)\b',
-                r'\bchart\s+(of|showing|for)\b',
-                r'\b(show|give|generate|create|display)\s+(me\s+)?(a\s+)?(graph|chart)\b',
-                r'\b(graph|chart)\s+(of|for|showing)\b',
-                # "Which X has most/least" queries
+                # Ranking queries that don't explicitly ask for charts should be tables
                 r'\bwhich\s+(user|users?|module|modules?|person|people)\s+(has|have)\s+(the\s+)?(most|least|fewest)',
                 r'\bwhich\s+(user|users?|module|modules?|person|people)\s+completed\s+(the\s+)?(most|least|fewest)',
-                # Completion rate queries that are rankings (not comparisons)
-                r'\btop\s+\d*\s*(?:modules?|trainings?|courses?)\s+by\s+completion\s+rate',
-                r'\btop\s+(?:modules?|trainings?|courses?)\s+by\s+completion\s+rate',
-                r'completion\s+rate\s+by\s+(?:module|training|course)',
-                r'\bby\s+completion\s+rate\b',
-                # Ranking queries (most/least/top/best)
                 r'\bmost\s+(completed|completions|popular|common|modules?)\b',
                 r'\bleast\s+(completed|completions|popular|common|modules?)\b',
                 r'\bwhat\s+(are\s+)?(the\s+)?(most|top|best|highest)\s+(completed|completions)',
                 r'\bwhat\s+(are\s+)?(the\s+)?(least|worst|lowest|bottom)\s+(completed|completions)',
-                r'\bby\s+(city|cities|country|countries|skill|skills|product|products|module|modules|department|team|region|location)\b',
-                r'\bbreakdown\s+by\b',
-                r'\bdistribution\b',
-                r'\bper\s+(city|country|skill|product|module)\b',
-                r'\bacross\s+(cities|countries|skills|products|modules|regions|locations)\b',
                 r'\btop\s+\d+\b',
                 r'\bbest\s+\d+\b',
                 r'\bworst\s+\d+\b',
                 r'\bbottom\s+\d+\b',
                 r'\bhighest\s+\d+\b',
                 r'\blowest\s+\d+\b',
+                # Breakdown queries that don't explicitly ask for charts should be tables
+                r'\bby\s+(city|cities|country|countries|skill|skills|product|products|module|modules|department|team|region|location)\b',
+                r'\bbreakdown\s+by\b',
+                r'\bdistribution\b',
+                r'\bper\s+(city|country|skill|product|module)\b',
+                r'\bacross\s+(cities|countries|skills|products|modules|regions|locations)\b',
                 r'\bgroup\s+by\b',
             ],
+            'response_type': ResponseType.TABLE,
+            'priority': 12
+        },
+        
+        # 4) LINE_CHART patterns - TREND / TIME SERIES
+        # CRITICAL: Only trigger line charts when user EXPLICITLY asks for a graph/chart with time
+        'line_chart': {
+            'patterns': [
+                r'\b(line|time)\s+(graph|chart)\b',
+                r'\bgraph\s+(of|showing)\s+(trend|over\s+time|time\s+series)',
+                r'\bchart\s+(of|showing)\s+(trend|over\s+time|time\s+series)',
+                r'\b(line|trend)\s+graph\b',
+                r'\b(line|trend)\s+chart\b',
+                r'\btrend\b',
+                r'\bover\s+time\b',
+                r'\btime\s+series\b',
+            ],
+            'response_type': ResponseType.LINE_CHART,
+            'priority': 17
+        },
+        
+        # Pie chart patterns (subset of breakdown)
+        # CRITICAL: Only trigger pie charts when user EXPLICITLY asks for a pie chart
+        'pie_chart': {
+            'patterns': [
+                r'\bpie\s+chart\b',
+                r'\bpie\s+graph\b',
+                r'\bdonut\s+chart\b',
+                r'\bdoughnut\s+chart\b',
+            ],
+            'response_type': ResponseType.PIE_CHART,
+            'priority': 17
+        },
+        
+        # 3) BAR_CHART patterns - BREAKDOWN / GROUP BY
+        # CRITICAL: Only trigger charts when user EXPLICITLY asks for a graph or chart
+        'bar_chart': {
+            'patterns': [
+                # Explicit chart/graph requests ONLY
+                r'\bgraph\s+of\b',
+                r'\bchart\s+of\b',
+                r'\bgraph\s+(of|showing|for)\b',
+                r'\bchart\s+(of|showing|for)\b',
+                r'\b(show|give|generate|create|display)\s+(me\s+)?(a\s+)?(graph|chart)\b',
+                r'\b(graph|chart)\s+(of|for|showing)\b',
+                r'\b(bar|line|pie)\s+(graph|chart)\b',
+                r'\bvisualize\b',
+                r'\bvisualization\b',
+            ],
             'response_type': ResponseType.BAR_CHART,
-            'priority': 11  # Higher priority than comparison to catch "top X by completion rate"
+            'priority': 17
         },
         
         # Multi-KPI patterns (SUMMARY)

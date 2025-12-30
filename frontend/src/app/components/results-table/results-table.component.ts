@@ -138,7 +138,14 @@ import { SchemaField } from '../../models';
             </svg>
           </div>
           @if (showQuery) {
-            <pre class="query-code font-mono">{{ generatedQuery | json }}</pre>
+            <div class="query-display">
+              @if (indexId) {
+                <div class="query-index-info">
+                  <strong>Index:</strong> {{ indexId }}
+                </div>
+              }
+              <pre class="query-code font-mono">{{ getQueryWithIndex() | json }}</pre>
+            </div>
           }
         </div>
       }
@@ -367,6 +374,21 @@ import { SchemaField } from '../../models';
       }
     }
     
+    .query-display {
+      margin-top: var(--spacing-sm);
+    }
+
+    .query-index-info {
+      padding: var(--spacing-xs) var(--spacing-sm);
+      background: rgba(8, 145, 178, 0.1);
+      border: 1px solid rgba(8, 145, 178, 0.2);
+      border-radius: var(--radius-sm);
+      font-size: 0.75rem;
+      color: var(--accent-primary);
+      margin-bottom: var(--spacing-xs);
+      font-family: var(--font-mono, monospace);
+    }
+
     .query-code {
       padding: var(--spacing-md);
       margin: 0;
@@ -387,6 +409,7 @@ export class ResultsTableComponent {
   @Input() error: string | null = null;
   @Input() activeFilters: string[] = [];
   @Input() generatedQuery: Record<string, any> | null = null;
+  @Input() indexId?: string; // Index ID being queried
   @Input() sortField: string | null = null;
   @Input() sortOrder: 'asc' | 'desc' = 'desc';
   
@@ -394,6 +417,17 @@ export class ResultsTableComponent {
   @Output() retry = new EventEmitter<void>();
 
   showQuery = false;
+
+  getQueryWithIndex(): any {
+    const query = this.generatedQuery || {};
+    if (this.indexId) {
+      return {
+        index_id: this.indexId,
+        query: query
+      };
+    }
+    return query;
+  }
 
   onSort(field: string) {
     const newOrder = this.sortField === field && this.sortOrder === 'desc' ? 'asc' : 'desc';

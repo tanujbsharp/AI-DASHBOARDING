@@ -73,15 +73,20 @@ AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 BEDROCK_MODEL_ID = os.getenv('BEDROCK_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0')
 USE_LLM = os.getenv('USE_LLM', 'true').lower() == 'true'
+USE_CONVERSATION_CONTEXT = os.getenv('USE_CONVERSATION_CONTEXT', 'false').lower() == 'true'
 
 # OpenSearch Configuration
 OPENSEARCH_DOMAIN_ENDPOINT = os.getenv('OPENSEARCH_DOMAIN_ENDPOINT')
 OPENSEARCH_MASTER_USER = os.getenv('OPENSEARCH_MASTER_USER')
 OPENSEARCH_MASTER_PASS = os.getenv('OPENSEARCH_MASTER_PASS')
 
-# Index Configuration - Using only module_consumption_data
+# Index Configuration - Multiple indices for different data types
 OPENSEARCH_INDEXES = {
     'module_consumption_data': os.getenv('MODULE_CONSUMPTION_DATA', 'converse_lm_consumption_summary_reports_prod'),
+    'user_profile_data': os.getenv('LEARNBEE_MODULE_REPORTS_DATA', 'learnbee_module_reports_user_summary_prod'),
+    'module_catalog_data': os.getenv('LM_SUMMARY_DATA', 'converse_lm_summary_reports_prod'),
+    # Monthly per-user activity summary (counts + points). Env var name per project: MONTHY_USER_ACTIVITY
+    'monthly_user_activity_data': os.getenv('MONTHY_USER_ACTIVITY', 'monthly_user_activity_summary_prod'),
 }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

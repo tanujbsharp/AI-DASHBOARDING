@@ -28,19 +28,45 @@ class QueryPromptBuilder:
 CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
 ══════════════════════════════════════════════════════════════════════════════
 
-🔴 MANDATORY DEFAULT FILTERS:
-   ALWAYS add this filter unless user explicitly asks otherwise:
-   {"term": {"user_status": 5}}     ← Active users only!
+🔴 MANDATORY DEFAULT FILTERS (INDEX-SPECIFIC):
+   ⚠️ CRITICAL: Default filters vary by index! Check which index you're querying!
    
-   🔴 CRITICAL: For completion/assignment queries, you MUST also add:
-   {"term": {"assigned_status": 0}} ← Assigned records only!
+   FOR CONSUMPTION INDEX (module_consumption_data) ONLY:
+   - ALWAYS add: {"term": {"user_status": 5}} ← Active users only!
+   - For completion/assignment queries, ALSO add: {"term": {"assigned_status": 0}} ← Assigned records only!
+   - For module queries, ALSO add: {"term": {"module_status": 0}} ← Published modules only!
+   
+   FOR CATALOG INDEX (module_catalog_data):
+   - For module queries, add: {"term": {"status": 0}} ← Published modules only!
+   - DO NOT add user_status or assigned_status (these fields don't exist in catalog index!)
+   
+   FOR USER PROFILE INDEX (user_profile_data):
+   - For user queries, add: {"term": {"status": 5}} ← Active users only! (NOT user_status!)
+   - DO NOT add module_status, assigned_status, or completed_status (these fields don't exist!)
+   
+   FOR MONTHLY USER ACTIVITY INDEX (monthly_user_activity_data):
+   - ALWAYS add: {"term": {"status": 5}} and {"term": {"cmid": 1}} ← Active users in this tenant only!
+   - Use completed_on (epoch) for month/time filters and monthly trends
+   - Metrics are MONTHLY counts/points fields: module, instant_answers, learning_pathway, lotd, points (NOT module names)
+   - Unique users field is "id" (NOT uid) in this index
+   - DO NOT use completed_status/assigned_status/module_name/mid (this index is NOT event-level)
    
    This applies to queries about:
-   - Completions (e.g., "how many modules has [user] completed", "total completions")
-   - Assignments (e.g., "assigned modules", "modules assigned to users")
-   - Module interactions (e.g., "modules completed", "modules in progress")
+   - Completions (consumption index only)
+   - Assignments (consumption index only)
+   - Module interactions (consumption index only)
+   - Module catalog (catalog index only)
+   - User directory (user profile index only)
    
    See the response_type guidance below for specific examples.
+
+🔴 RESPONSE TYPE DECISION GUIDE:
+   - Use "kpi_widget" (or "multi_kpi") for KPI-style asks ("how many", "total", "average", "count", "rate").
+   - Use "table" when the user wants rows: "list", "show me", "give me", "who/which users/modules", breakdowns without the word chart.
+   - Use "bar_chart" when the user explicitly says "chart/graph/visualize" (default chart type for rankings/breakdowns).
+   - Use "line_chart" when the user mentions "trend", "over time", "time series", "plot" or a "line graph/chart".
+   - Use "pie_chart" ONLY when the user specifically says "pie/donut chart".
+   - If both "chart/graph" and table keywords appear, prefer the chart response type.
 
 🔴 ID FIELDS FOR COUNTING (NEVER USE NAME FIELDS FOR CARDINALITY):
    ┌─────────────────────────────────────────────────────────────────────────┐
@@ -51,6 +77,9 @@ CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
    
    CORRECT: {"cardinality": {"field": "uid"}}
    WRONG:   {"cardinality": {"field": "email_addr"}}
+   
+   ⚠️ MONTHLY ACTIVITY INDEX EXCEPTION:
+   - Unique users in monthly_user_activity_data use: {"cardinality": {"field": "id"}} (NOT uid)
    
    CORRECT: {"cardinality": {"field": "mid"}}
    WRONG:   {"cardinality": {"field": "module_name"}}
@@ -100,16 +129,34 @@ CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
 STATUS CODE MAPPINGS
 ══════════════════════════════════════════════════════════════════════════════
 
-  User Status:
-    - "active users" / "enabled" → user_status = 5 (DEFAULT - always apply!)
-    - "invited users" / "pending invite" → user_status = 1
-    - "deleted users" / "inactive" → user_status = 4
+  User Status (🔴 CRITICAL - FIELD NAME VARIES BY INDEX):
+    🔴 FIELD NAME DIFFERS BY INDEX:
+    - CONSUMPTION INDEX (converse_lm_consumption_summary_reports_prod): Use "user_status"
+    - USER PROFILE INDEX (learnbee_module_reports_user_summary_prod): Use "status" (NOT user_status!)
+    - CATALOG INDEX: Does NOT have user status fields
+    
+    Status codes (same for both):
+    - "active users" / "enabled" → 5 (DEFAULT - always apply!)
+    - "invited users" / "pending invite" → 1
+    - "deleted users" / "inactive" → 4
+    
+    ⚠️ ALWAYS check the selected index_id to determine which field name to use!
 
-  Module Status:
-    - "published modules" / "live" → module_status = 0
-    - "draft modules" / "unpublished" → module_status = 2
-    - "deleted modules" / "retired" → module_status = 1
-    - DEFAULT RULE: Unless the user explicitly requests "draft", "deleted", "retired", "removed", "archived", or "unpublished" modules, ALWAYS add {"term": {"module_status": 0}} for every module / training / course query (counts, assignments, completions, lists, breakdowns, charts).
+  Module Status (🔴 CRITICAL - FIELD NAME VARIES BY INDEX):
+    🔴 FIELD NAME DIFFERS BY INDEX:
+    - CONSUMPTION INDEX (converse_lm_consumption_summary_reports_prod): Use "module_status"
+    - CATALOG INDEX (converse_lm_summary_reports_prod): Use "status" (NOT module_status!)
+    - USER PROFILE INDEX: Does NOT have module status fields
+    
+    Status codes (same for both module_status and status in catalog):
+    - "published modules" / "live" → 0
+    - "draft modules" / "unpublished" → 2
+    - "deleted modules" / "retired" → 1
+    
+    DEFAULT RULE: Unless the user explicitly requests "draft", "deleted", "retired", "removed", "archived", or "unpublished" modules:
+    - For CONSUMPTION INDEX: ALWAYS add {"term": {"module_status": 0}}
+    - For CATALOG INDEX: ALWAYS add {"term": {"status": 0}}
+    ⚠️ ALWAYS check the selected index_id to determine which field name to use!
 
   Completion Status:
     - "completed" / "finished" / "done" / "passed" → completed_status = 1
@@ -492,6 +539,115 @@ INDEX INFORMATION & SCHEMA
 
 {schema_context}
 
+🔴🔴🔴 CRITICAL: INDEX SELECTION RULES - READ THIS FIRST! 🔴🔴🔴
+You MUST choose the correct index based on what the user is asking about. WRONG INDEX = WRONG DATA!
+
+1. MODULE CONSUMPTION INDEX (index_id: "module_consumption_data" - maps to MODULE_CONSUMPTION_DATA env var):
+   ✅ USE FOR:
+   - Module completions ("who completed", "completion rate", "completions in November")
+   - Completion dates, completion statistics
+   - Assigned modules ("modules assigned to users", "who was assigned")
+   - Training progress, completion percentages
+   - Module ratings (ratings given by users)
+   - ANY question that combines USER + MODULE + COMPLETION/ASSIGNMENT data
+   
+   ❌ DO NOT USE FOR:
+   - "Modules published" / "modules published in [time]" → Use CATALOG index!
+   - "Module catalog" / "list all modules" → Use CATALOG index!
+   - "Module metadata" / "module types" → Use CATALOG index!
+   - Pure user directory (no module/completion context) → Use USER PROFILE index!
+   
+   🔴 FIELD NAMES: Uses "module_status" (NOT "status") and "user_status" (NOT "status")
+   🔴 DOES NOT HAVE: "status" field (only has "module_status" and "user_status")
+
+2. MODULE CATALOG INDEX (index_id: "module_catalog_data" - maps to LM_SUMMARY_DATA env var):
+   ✅ USE FOR:
+   - "Modules published" / "modules published in [time period]" ← THIS IS THE KEY INDICATOR!
+   - "Module catalog" / "list all modules" / "show modules"
+   - Module metadata (names, types, product/skill tags, estimated time)
+   - Publishing/content ops questions
+   - Taxonomy/tagging questions ("modules by product", "modules by skill")
+   - Module counts by product/skill/type
+   - Average estimated time
+   - ANY question about MODULE MASTER DATA without user/completion context
+   
+   ❌ DO NOT USE FOR:
+   - "Who completed" / "completion rate" / "completions" → Use CONSUMPTION index!
+   - "Assigned modules" / "modules assigned" → Use CONSUMPTION index!
+   - Any question mentioning users, completions, assignments, ratings → Use CONSUMPTION index!
+   
+   🔴 FIELD NAMES: Uses "status" for module status (NOT "module_status")
+   🔴 DOES NOT HAVE: "module_status", "user_status", "assigned_status", "completed_status", "user_status", "completed_date"
+
+3. USER PROFILE INDEX (index_id: "user_profile_data" - maps to LEARNBEE_MODULE_REPORTS_DATA env var):
+   ✅ USE FOR:
+   - User directory lookups ("find user by email", "list users")
+   - User profile information queries ("info on [user name]", "give me info on tanuj", "user details", "show me user profile")
+   - User counts ("how many active users")
+   - User segmentation by location/role/designation
+   - User breakdowns ("users by city", "users by designation")
+   - User creation/update dates
+   - Any query asking for user profile fields (first_name, last_name, email_addr, country, hired_on, designation, user_role, manager_email_addr, etc.) WITHOUT module/completion context
+   - Pure user profile data WITHOUT any module/completion context
+   
+   ❌ DO NOT USE FOR:
+   - "Users who completed" / "completion rate" / "which modules did user complete" → Use CONSUMPTION index!
+   - "Assigned modules" / "modules assigned to users" → Use CONSUMPTION index!
+   - Any question mentioning modules, completions, assignments, ratings → Use CONSUMPTION index!
+   - Questions that combine user profile + module completion data → Use CONSUMPTION index!
+   
+   🔴 FIELD NAMES: Uses "status" for user status (NOT "user_status")
+   🔴 DOES NOT HAVE: "module_status", "user_status", "assigned_status", "completed_status", "module_name", "mid"
+
+4. MONTHLY USER ACTIVITY INDEX (index_id: "monthly_user_activity_data" - maps to MONTHY_USER_ACTIVITY env var):
+   ✅ USE FOR:
+   - Monthly totals (e.g., "total module completions in Nov 2025", "total points last month")
+   - Monthly engagement metrics: module, instant_answers, learning_pathway, lotd, points
+   - Monthly trends across multiple months (e.g., "monthly points trend for 2025")
+   - Monthly leaderboards (e.g., "top 20 users by points in Nov 2025", "users with zero module completions last month")
+   - Monthly breakdowns/segmentation (e.g., "points by designation last month", "module completions by city in 2025")
+   
+   ❌ DO NOT USE FOR:
+   - "Which modules were completed?" / module_name breakdown (this index has no module IDs/names)
+   - Event-level completion details, assignments, completion_rate calculations → Use CONSUMPTION index instead
+   
+   🔴 FIELD NAMES:
+   - User status: "status" (NOT user_status)
+   - Activity month anchor: "completed_on" (epoch)
+   - Unique user id: "id" (NOT uid)
+   - Tenant scope: ALWAYS filter {"term": {"cmid": 1}}
+   - Metrics (MONTHLY COUNTS): module, instant_answers, learning_pathway, lotd, points
+   
+   🔴 DOES NOT HAVE: module_status, user_status, assigned_status, completed_status, module_name, mid, ratings
+
+🔴🔴🔴 DECISION TREE - USE THIS TO CHOOSE THE INDEX:
+1. Does the question ask for USER PROFILE INFORMATION (name, email, location, designation, hired_on, user_role, etc.) WITHOUT mentioning modules/completions?
+   Examples: "info on [user]", "give me info on tanuj", "user details", "find user by email", "list users", "show me user profile"
+   → YES → Use USER PROFILE index (user_profile_data) ← CHECK THIS FIRST FOR USER QUERIES!
+
+2. Does the question ask for MONTHLY ACTIVITY / ENGAGEMENT METRICS (module counts, instant answers, learning pathway, LOTD, points), monthly totals, monthly trends, or monthly leaderboards?
+   Examples: "total points last month", "monthly module completions trend for 2025", "instant answers in Nov 2025", "top users by points last month"
+   → YES → Use MONTHLY USER ACTIVITY index (monthly_user_activity_data)
+   
+3. Does the question mention "published" / "publishing" / "publish date"?
+   → YES → Use CATALOG index (module_catalog_data)
+   
+4. Does the question mention EVENT-LEVEL "completed" / "completion rate" / "assigned" / "ratings" / "which modules did user complete"?
+   → YES → Use CONSUMPTION index (module_consumption_data)
+   
+5. Does the question mention BOTH user info AND module activity/completion?
+   → YES → Use CONSUMPTION index (module_consumption_data)
+   
+6. Is it ONLY about module catalog/metadata (no users, no completions)?
+   → YES → Use CATALOG index (module_catalog_data)
+
+🔴🔴🔴 CRITICAL: ALWAYS USE EXACT FIELD NAMES FROM THE SELECTED INDEX
+- You MUST check the schema_context to see which fields exist in the selected index
+- NEVER use "module_status" when querying catalog index - use "status" instead
+- NEVER use "user_status" when querying catalog or user profile index - catalog has no user fields, user profile uses "status"
+- NEVER use fields that don't exist in the selected index
+- The schema_context shows EXACTLY which fields are available - use ONLY those fields
+
 {date_context}
 
 {normalization_rules}
@@ -503,7 +659,7 @@ INDEX INFORMATION & SCHEMA
 OUTPUT FORMAT:
 Return a JSON object with this EXACT structure:
 {{
-  "index_id": "module_consumption_data",
+  "index_id": "module_consumption_data",  // SINGLE index only - NEVER use arrays!
   "query": {{
     // Your OpenSearch query here
   }},
@@ -511,6 +667,20 @@ Return a JSON object with this EXACT structure:
   "title": "Brief title for the results",
   "description": "What this query retrieves"
 }}
+
+🔴 CRITICAL: INDEX ID VALUES - USE THESE EXACT STRINGS:
+- For CONSUMPTION index (MODULE_CONSUMPTION_DATA env var): "module_consumption_data"
+- For CATALOG index (LM_SUMMARY_DATA env var): "module_catalog_data"  
+- For USER PROFILE index (LEARNBEE_MODULE_REPORTS_DATA env var): "user_profile_data"
+- For MONTHLY USER ACTIVITY index (MONTHY_USER_ACTIVITY env var): "monthly_user_activity_data"
+
+🔴 CRITICAL: SINGLE INDEX ONLY
+- ALWAYS specify a SINGLE index_id as a string using the exact values above
+- NEVER use arrays or multiple indices (e.g., ["index1", "index2"] is FORBIDDEN)
+- NEVER use environment variable names (MODULE_CONSUMPTION_DATA, LM_SUMMARY_DATA, etc.)
+- NEVER use actual index names (converse_lm_consumption_summary_reports_prod, etc.)
+- Choose the ONE index that best matches the user's question
+- Use only fields that exist in the selected index
 
 AGGREGATION RULES:
 - For counts: Use size: 0 with aggregations

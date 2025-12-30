@@ -148,16 +148,37 @@ class OpenSearchClient:
         return fields
     
     def execute_query(self, index_id: str, query: Dict[str, Any], size: int = 100) -> Dict[str, Any]:
-        """Execute an Elasticsearch query on the specified index."""
+        """
+        Execute an Elasticsearch query on the specified index(es).
+        
+        Args:
+            index_id: Single index_id string OR comma-separated string of index_ids OR list of index_ids
+            query: OpenSearch query dictionary
+            size: Default size if not in query
+            
+        Returns:
+            Query results dictionary
+        """
         if not self._client:
             return {'error': 'OpenSearch client not initialized'}
         
-        index_name = self.get_index_name(index_id)
-        if not index_name:
-            # Log available indexes for debugging
-            available = list(settings.OPENSEARCH_INDEXES.keys())
-            logger.error(f"Index {index_id} not found in configuration. Available indexes: {available}")
-            return {'error': f'Index {index_id} not found in configuration. Available: {available}'}
+        # Handle multiple indices - support string (single or comma-separated) or list
+        if isinstance(index_id, list):
+            index_ids = index_id
+        elif ',' in index_id:
+            index_ids = [idx.strip() for idx in index_id.split(',')]
+        else:
+            index_ids = [index_id]
+        
+        # Convert all index_ids to actual index names
+        index_names = []
+        for idx_id in index_ids:
+            index_name = self.get_index_name(idx_id)
+            if not index_name:
+                available = list(settings.OPENSEARCH_INDEXES.keys())
+                logger.error(f"Index {idx_id} not found in configuration. Available indexes: {available}")
+                return {'error': f'Index {idx_id} not found in configuration. Available: {available}'}
+            index_names.append(index_name)
         
         # Ensure query doesn't have any index references that could confuse OpenSearch
         # Remove any index fields from query body if present
@@ -171,8 +192,10 @@ class OpenSearchClient:
             if 'size' not in query_clean:
                 query_clean['size'] = size
             
-            logger.debug(f"Executing query on index: {index_name} (index_id: {index_id})")
-            response = self._client.search(index=index_name, body=query_clean)
+            # OpenSearch supports multiple indices - pass as comma-separated string or list
+            index_param = ','.join(index_names) if len(index_names) > 1 else index_names[0]
+            logger.debug(f"Executing query on index(es): {index_param} (index_id(s): {index_id})")
+            response = self._client.search(index=index_param, body=query_clean)
             
             hits = response.get('hits', {})
             total = hits.get('total', {})

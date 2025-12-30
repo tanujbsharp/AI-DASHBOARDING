@@ -21,23 +21,88 @@ class SchemaContextBuilder:
     # This helps the LLM choose the right index based on user questions
     INDEX_DESCRIPTIONS = {
         'converse_lm_consumption_summary_reports_prod': (
-            "Module Consumption & Completion Data - This index tracks user learning progress, "
-            "module assignments, completions, and training consumption. It contains records of "
-            "users assigned to training modules, their completion status, completion dates, ratings, "
-            "and progress. Use this index for queries about: user completions, module completion rates, "
-            "assigned modules, training progress, user learning activity, module ratings, completion "
-            "statistics, and any questions about who completed what training and when."
+            "🔴 MODULE CONSUMPTION & COMPLETION DATA - Use this ONLY for consumption/completion questions! "
+            "This index tracks user learning progress, module assignments, completions, and training consumption. "
+            "It contains records of users assigned to training modules, their completion status, completion "
+            "dates, ratings, and progress. 🔴 KEY INDICATORS: 'completed', 'completion', 'assigned', 'ratings', "
+            "'who completed', 'completion rate' → USE THIS INDEX! Use this index for queries about: user "
+            "completions, module completion rates, assigned modules, training progress, user learning "
+            "activity, module ratings, completion statistics, and any questions about who completed what "
+            "training and when. DO NOT use this index for: 'modules published', 'publishing', 'publish date' "
+            "→ Use catalog index instead!"
+        ),
+                'learnbee_module_reports_user_summary_prod': (
+                    "User Profile & Directory Data - This index contains USER PROFILE + LOCATION + META + "
+                    "CUSTOM ATTRIBUTES only. It does NOT contain module completion events, module assignments, "
+                    "or training progress. Tenant scope is enforced via cmid=1 (ALWAYS include {\"term\": {\"cmid\": 1}} "
+                    "when querying this index). Use this index for queries about: user directory lookups, user profile "
+                    "information queries (\"info on [user name]\", \"give me info on tanuj\", \"user details\"), "
+                    "user counts (active/invited/deleted), user segmentation by location (city/state/country), "
+                    "user breakdowns by designation/role, finding users by email/uid/name, user creation/update "
+                    "dates, and any query asking for user profile fields (first_name, last_name, email_addr, "
+                    "country, hired_on, designation, user_role, manager_email_addr, etc.) WITHOUT module/completion "
+                    "context. DO NOT use this index for: module completions, completion rates, assigned modules, "
+                    "training progress, module names, scores, completion dates, or any question that combines "
+                    "user profile + module activity. For those queries, use the module consumption index instead."
+                ),
+        'monthly_user_activity_summary_prod': (
+            "🔴 MONTHLY USER ACTIVITY SUMMARY (COUNTS + POINTS) - Each record is ONE USER for ONE MONTH. "
+            "This index stores MONTHLY per-user COUNTS and POINTS only (not event-level module records). "
+            "Use it for monthly totals, monthly trends, leaderboards, and segmentation of: "
+            "module (monthly module completions count), instant_answers, learning_pathway, lotd, points. "
+            "⚠️ DOES NOT support: 'which modules were completed' / module_name breakdown (no module IDs/names). "
+            "Tenant scope is enforced via cmid=1 (ALWAYS include {\"term\": {\"cmid\": 1}} when querying this index). "
+            "Time filtering for activity months MUST use completed_on (epoch). Operational freshness questions can use updated_on / last_updated."
+        ),
+        'converse_lm_summary_reports_prod': (
+            "🔴 MODULE CATALOG & METADATA INDEX - Use this for ALL 'published' / 'publishing' questions! "
+            "This index contains MODULE/COURSE MASTER DATA only: module names, types, product/skill tags, "
+            "estimated time, publish dates, status (published/draft/deleted), and metadata timestamps. "
+            "🔴 KEY INDICATORS: 'modules published', 'published in', 'publishing', 'publish date' → USE THIS INDEX! "
+            "It does NOT contain user completion events, completion dates, assigned_status, completed_status, "
+            "or any learner data. Use this index for queries about: module catalog lookups, finding modules "
+            "by name/type/product/skill/tags, module metadata summaries, publishing/content ops questions "
+            "(modules published in a time period), taxonomy/tagging questions, module counts by product/"
+            "skill/type, average estimated time. DO NOT use this index for: completion rates, who completed "
+            "modules, completion statistics, assigned modules, or any learner-related queries. For those "
+            "queries, use the module consumption index instead."
         ),
         # Add more index descriptions here as you add new indices
-        # Example:
-        # 'sales_data': (
-        #     "Sales Data - This index contains sales transactions, revenue, customer purchases, "
-        #     "and sales performance metrics. Use for queries about: sales figures, revenue, "
-        #     "customer orders, sales trends, and product sales."
-        # ),
+    }
+    
+    # Index-specific field mappings - CRITICAL: Fields differ by index!
+    # This prevents confusion between similar field names in different indices
+    INDEX_FIELD_MAPPINGS = {
+        'converse_lm_consumption_summary_reports_prod': {
+            # Module status field name in CONSUMPTION index
+            'module_status': 'Module status: 0=published, 1=deleted, 2=draft - USE THIS FIELD NAME in consumption index',
+            # User status field name
+            'user_status': 'User status code: 5=active, 4=deleted, 1=invited',
+            # NOTE: This index does NOT have a field called "status" - only "module_status" and "user_status"
+        },
+        'converse_lm_summary_reports_prod': {
+            # Module status field name in CATALOG index
+            'status': 'Module status: 0=published, 1=deleted, 2=draft - USE THIS FIELD NAME in catalog index',
+            # NOTE: This index does NOT have "module_status" - only "status"
+            # NOTE: This index does NOT have "user_status" - it's module catalog only
+        },
+        'learnbee_module_reports_user_summary_prod': {
+            # User status field name in USER PROFILE index
+            'status': 'User status code: 5=active, 4=deleted, 1=invited - USE THIS FIELD NAME in user profile index',
+            # NOTE: This index does NOT have "module_status" - it's user profiles only
+            # NOTE: This index does NOT have "user_status" - only "status"
+        },
+        'monthly_user_activity_summary_prod': {
+            # User status field name in MONTHLY ACTIVITY index
+            'status': 'User status code: 5=active, 4=deleted, 1=invited - USE THIS FIELD NAME in monthly activity index',
+            'cmid': 'Tenant/container scope - ALWAYS filter cmid=1 in this deployment',
+            'id': 'Unique user record ID in this index - USE THIS for counting unique users (cardinality)',
+            'completed_on': 'Activity month anchor timestamp (epoch) - USE THIS for monthly activity time filters and trends'
+        }
     }
     
     # Field descriptions for better LLM understanding - aligned with usecase.md Section A
+    # NOTE: These are general descriptions. Always check INDEX_FIELD_MAPPINGS for index-specific field names!
     FIELD_DESCRIPTIONS = {
         # USER DIMENSIONS
         'uid': 'Unique numeric User ID - USE THIS for counting unique users/learners (cardinality)',
@@ -46,20 +111,22 @@ class SchemaContextBuilder:
         'email_addr': 'User email address (for display, not for counting)',
         'mobile_number': 'User mobile/phone number',
         'user_role': 'User role: admin / learner / manager',
-        'user_status': 'User status code: 5=active, 4=deleted, 1=invited',
+        'user_status': 'User status code: 5=active, 4=deleted, 1=invited (CONSUMPTION INDEX ONLY)',
+        'status': 'Status field - MEANING VARIES BY INDEX: In catalog index = module status (0=published, 1=deleted, 2=draft). In user profile / monthly activity indices = user status (5=active, 4=deleted, 1=invited)',
         'is_admin': 'Admin flag: yes/no',
         'designation': 'Job title/designation',
         'language_name': 'User preferred language',
         'hired_on': 'Date the user joined/was hired',
         'user_created_on': 'Account creation date',
         'manager_email_addr': 'Email of the user\'s manager',
+        'dob': 'Date of birth (keyword field, format may vary)',
         
         # MODULE / COURSE DIMENSIONS
         'mid': 'Unique numeric Module ID - USE THIS for counting unique modules (cardinality)',
-        'cmid': 'Course or module ID - USE THIS for counting unique courses/containers',
+        'cmid': 'Course/Container/Tenant scope ID (integer). In this deployment ALWAYS filter cmid=1 for tenant scope; use cardinality(cmid) only if user explicitly asks for unique courses/containers',
         'module_name': 'Training module/course name (for display, NOT for counting)',
         'module_type_name': 'Type/category of module',
-        'module_status': 'Module status: 0=published, 1=deleted, 2=draft',
+        'module_status': 'Module status: 0=published, 1=deleted, 2=draft (CONSUMPTION INDEX ONLY - catalog index uses "status" instead)',
         'module_points': 'Points awarded for completing the module',
         'module_created_by': 'User who created the module',
         'module_created_on': 'Date module was created in the LMS (not published)',
@@ -67,6 +134,7 @@ class SchemaContextBuilder:
         'module_desc': 'Module description text',
         'module_imp_name': 'Module implementation name',
         'pre_req_module_name': 'Prerequisite module name',
+        'equivalence_module_name': 'Equivalent module name',
         'prod_master_name': 'Master product grouping/family',
         'product_name': 'Product category/name',
         'skill_name': 'Skill category associated with module',
@@ -76,20 +144,22 @@ class SchemaContextBuilder:
         'coach_email_addr': 'Coach email assigned to module',
         'staff': 'Staff/owner of the module',
         'published_date': 'Date the module was published/went live - USE THIS for "modules published" queries',
-        'equivalence_module_name': 'Equivalent module name for cross-credit',
         'estd_time': 'Estimated minutes needed to complete module',
         'ratings': 'Ratings given to the module',
+        'version': 'Record version number',
+        'created_by': 'User who created the record',
+        'language_name': 'Language name (for modules in catalog index)',
         
-        # COMPLETION / CONSUMPTION DIMENSIONS
-        'assigned_status': 'Assignment flag: 0=assigned, 1=not assigned',
-        'completed_status': 'Completion status: 0=not completed, 1=completed',
-        'complete_percentage': 'Completion percentage: 0-100',
-        'completed_date': 'Date when user finished the module',
-        'complete_type': 'Completion type: learning / assessment / equivalence',
-        'complete_version': 'Version of the module that was completed',
-        'comments': 'User comments/feedback on completion',
-        'invited_date': 'Date invitation was sent to the learner',
-        'invited_time': 'Time invitation was sent',
+        # COMPLETION / CONSUMPTION DIMENSIONS (CONSUMPTION INDEX ONLY)
+        'assigned_status': 'Assignment flag: 0=assigned, 1=not assigned (CONSUMPTION INDEX ONLY)',
+        'completed_status': 'Completion status: 0=not completed, 1=completed (CONSUMPTION INDEX ONLY)',
+        'complete_percentage': 'Completion percentage: 0-100 (CONSUMPTION INDEX ONLY)',
+        'completed_date': 'Date when user finished the module (CONSUMPTION INDEX ONLY)',
+        'complete_type': 'Completion type: learning / assessment / equivalence (CONSUMPTION INDEX ONLY)',
+        'complete_version': 'Version of the module that was completed (CONSUMPTION INDEX ONLY)',
+        'comments': 'User comments/feedback on completion (CONSUMPTION INDEX ONLY)',
+        'invited_date': 'Date invitation was sent to the learner (CONSUMPTION INDEX ONLY)',
+        'invited_time': 'Time invitation was sent (CONSUMPTION INDEX ONLY)',
         
         # LOCATION DIMENSIONS
         'city': 'City name in LOWERCASE (e.g., "bengaluru", "mumbai")',
@@ -97,11 +167,17 @@ class SchemaContextBuilder:
         'country': 'Full country name (e.g., "republic of india", "united arab emirates")',
         
         # META FIELDS
-        'created_by': 'User who created the record',
         'created_on': 'Primary assignment/record date (Unix timestamp)',
         'updated_on': 'Timestamp when record was last updated',
-        'version': 'Record version number',
-        'id': 'Internal record identifier',
+        'id': 'Internal record identifier (NOTE: in monthly_user_activity_summary_prod this is the user record ID; use cardinality(id) for unique users)',
+        'last_updated': 'Last sync/update timestamp (epoch) (MONTHLY ACTIVITY INDEX)',
+        'completed_on': 'Activity month anchor timestamp (epoch) - use for month/time filters and monthly trends (MONTHLY ACTIVITY INDEX)',
+        'module': 'Monthly count of module completions for that month (integer count) - use sum(module) for totals (MONTHLY ACTIVITY INDEX)',
+        'instant_answers': 'Monthly count of Instant Answer queries for that month (MONTHLY ACTIVITY INDEX)',
+        'learning_pathway': 'Monthly count of Learning Pathway completions for that month (MONTHLY ACTIVITY INDEX)',
+        'lotd': 'Monthly count of Learning Of The Day completions for that month (MONTHLY ACTIVITY INDEX)',
+        'points': 'Total points earned in that month (MONTHLY ACTIVITY INDEX)',
+        'total_points_assigned': 'Total points assigned for that month (may be empty/zero if not populated) (MONTHLY ACTIVITY INDEX)',
         
         # CUSTOM ATTRIBUTES (tenant-specific)
         'attribute_2': 'Custom attribute 2 (tenant-specific)',
@@ -223,8 +299,24 @@ class SchemaContextBuilder:
         
         parts.append("")
         
+        # Add critical field name warnings for this specific index
+        index_specific_fields = cls.INDEX_FIELD_MAPPINGS.get(index_id, {})
+        if index_specific_fields:
+            parts.append("🔴 CRITICAL: INDEX-SPECIFIC FIELD NAMES:")
+            parts.append("-" * 40)
+            for field_name, field_desc in index_specific_fields.items():
+                parts.append(f"  {field_name}: {field_desc}")
+            parts.append("")
+            parts.append("⚠️ WARNING: Field names differ between indices!")
+            parts.append("  - Consumption index uses: module_status, user_status")
+            parts.append("  - Catalog index uses: status (for modules)")
+            parts.append("  - User profile index uses: status (for users, different codes!)")
+            parts.append("  - Monthly activity index uses: status (users) + completed_on (monthly time anchor) + id (user id)")
+            parts.append("  - ALWAYS use the field names that exist in the selected index!")
+            parts.append("")
+        
         # Fields section
-        parts.append("AVAILABLE FIELDS:")
+        parts.append("ALL AVAILABLE FIELDS IN THIS INDEX:")
         parts.append("-" * 40)
         
         fields = schema.get('fields', [])
@@ -232,8 +324,11 @@ class SchemaContextBuilder:
             field_name = field.get('name', '')
             field_type = field.get('type', 'unknown')
             
-            # Get description
-            desc = cls.FIELD_DESCRIPTIONS.get(field_name, '')
+            # Get description - prioritize index-specific mapping
+            if field_name in index_specific_fields:
+                desc = index_specific_fields[field_name]
+            else:
+                desc = cls.FIELD_DESCRIPTIONS.get(field_name, '')
             
             # Build field line
             line = f"  {field_name} ({field_type})"
@@ -287,6 +382,7 @@ class SchemaContextBuilder:
   
   AGGREGATIONS (CRITICAL - use correct ID fields):
     - Count unique USERS: {"cardinality": {"field": "uid"}}  ← ALWAYS use uid, NOT email_addr
+    - (MONTHLY ACTIVITY INDEX) Count unique USERS: {"cardinality": {"field": "id"}}  ← In monthly_user_activity_summary_prod use id (NOT uid)
     - Count unique MODULES: {"cardinality": {"field": "mid"}}  ← ALWAYS use mid, NOT module_name
     - Count unique COURSES: {"cardinality": {"field": "cmid"}}  ← Use cmid for courses
     - Count unique MANAGERS: {"cardinality": {"field": "manager_email_addr"}}
@@ -294,6 +390,8 @@ class SchemaContextBuilder:
     - Count unique COACHES: {"cardinality": {"field": "coach_email_addr"}}
     - Group by field: {"terms": {"field": "city", "size": 100}}
     - Filter then count: {"filter": {"term": {...}}, "aggs": {"count": {"cardinality": {...}}}}
+    - (MONTHLY ACTIVITY INDEX) Monthly totals: {"sum": {"field": "module"}} / {"sum": {"field": "instant_answers"}} / {"sum": {"field": "points"}}
+    - (MONTHLY ACTIVITY INDEX) Monthly trend: {"date_histogram": {"field": "completed_on", "calendar_interval": "month"}} + sum(metric)
     
   GROUPING PATTERN (ID for query, NAME for display):
     When grouping by module/user, use ID field but add sub-agg for name:
@@ -302,6 +400,7 @@ class SchemaContextBuilder:
     
   IMPORTANT ID FIELDS:
     - uid = User ID (integer) - for counting unique users/learners
+    - id = User record ID in monthly activity index - for counting unique users in monthly_user_activity_summary_prod
     - mid = Module ID (integer) - for counting unique modules/courses
     - cmid = Course/Module ID - for counting unique courses/containers
     - DO NOT use email_addr or module_name for cardinality counts
@@ -327,15 +426,21 @@ class SchemaContextBuilder:
     uae/UAE -> "united arab emirates"
     germany -> "federal republic of germany"
   
-  USER STATUS CODES:
-    active/enabled -> user_status: 5
-    deleted/inactive -> user_status: 4
-    invited/pending invite -> user_status: 1
+  USER STATUS CODES (🔴 FIELD NAME VARIES BY INDEX):
+    🔴 CONSUMPTION INDEX: Use "user_status" field
+    🔴 USER PROFILE INDEX: Use "status" field (NOT user_status!)
+    Status codes (same for both):
+    active/enabled -> 5
+    deleted/inactive -> 4
+    invited/pending invite -> 1
   
-  MODULE STATUS CODES:
-    published/live -> module_status: 0
-    deleted/retired -> module_status: 1
-    draft/unpublished -> module_status: 2
+  MODULE STATUS CODES (🔴 FIELD NAME VARIES BY INDEX):
+    🔴 CONSUMPTION INDEX: Use "module_status" field
+    🔴 CATALOG INDEX: Use "status" field (NOT module_status!)
+    Status codes (same for both):
+    published/live -> 0
+    deleted/retired -> 1
+    draft/unpublished -> 2
   
   COMPLETION STATUS:
     completed/done/finished -> completed_status: 1

@@ -14,6 +14,8 @@ export interface ChatMessage {
   error?: string;
   isLoading?: boolean;
   showQuery?: boolean;
+  indexId?: string; // Index ID being queried
+  response?: any; // Full response object (contains index_id)
   // New fields for response types
   responseType?: string;
   visualization?: {
@@ -180,7 +182,14 @@ interface KPIData {
                     </svg>
                   </button>
                   @if (message['showQuery']) {
-                    <pre class="query-code font-mono">{{ message.query | json }}</pre>
+                    <div class="query-display">
+                      @if (message.indexId || message.response?.index_id) {
+                        <div class="query-index-info">
+                          <strong>Index:</strong> {{ message.indexId || message.response?.index_id }}
+                        </div>
+                      }
+                      <pre class="query-code font-mono">{{ getQueryWithIndex(message) | json }}</pre>
+                    </div>
                   }
                 </div>
               }
@@ -937,6 +946,19 @@ export class ChatInterfaceComponent {
   useExample(example: string) {
     this.inputText = example;
     this.sendMessage();
+  }
+
+  getQueryWithIndex(message: ChatMessage): any {
+    const query = message.query || {};
+    // Try to get indexId from message.indexId first, then from response.index_id
+    const indexId = message.indexId || message.response?.index_id;
+    if (indexId) {
+      return {
+        index_id: indexId,
+        query: query
+      };
+    }
+    return query;
   }
 
   extractKPIs(message: ChatMessage): KPIData[] {

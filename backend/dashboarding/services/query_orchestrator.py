@@ -115,7 +115,8 @@ class QueryOrchestrator:
     
     def __init__(self):
         self.os_client = OpenSearchClient()
-        self.context_manager = get_context_manager()
+        self.use_conversation_context = getattr(settings, 'USE_CONVERSATION_CONTEXT', False)
+        self.context_manager = get_context_manager() if self.use_conversation_context else None
         self.schema_cache: Dict[str, Dict] = {}
         self._load_schemas()
     
@@ -150,9 +151,12 @@ class QueryOrchestrator:
         """
         query_payload = None  # Initialize to capture query in case of errors
         try:
-            # Step 1: Get/create conversation context
-            context = self.context_manager.get_or_create(session_id)
-            context.add_message("user", user_message)
+            # Step 1: Get/create conversation context (optional)
+            if self.use_conversation_context:
+                context = self.context_manager.get_or_create(session_id)
+                context.add_message("user", user_message)
+            else:
+                context = ConversationContext()
             
             # Step 2: Extract basic intent using helper classes
             time_period = TimeHandler.parse(user_message)
@@ -167,13 +171,14 @@ class QueryOrchestrator:
             from .time_handler import TimeframeResolver
             timeframe_key = TimeframeResolver.extract_timeframe_key(user_message)
 
-            self.context_manager.update_from_message(
-                context, 
-                user_message, 
-                {},  # No entities - Bedrock will handle everything
-                time_period.__dict__ if time_period else None,
-                time_field=time_field_override
-            )
+            if self.use_conversation_context:
+                self.context_manager.update_from_message(
+                    context, 
+                    user_message, 
+                    {},  # No entities - Bedrock will handle everything
+                    time_period.__dict__ if time_period else None,
+                    time_field=time_field_override
+                )
             
             logger.info(f"Detected: response_type={response_type.value}, time={time_period.description if time_period else 'lifetime'}")
             effective_time_period = self._resolve_time_period(time_period, context)
@@ -206,6 +211,26 @@ class QueryOrchestrator:
                 return self._error_response(query_result['error'], query=error_query)
             
             query_payload = query_result
+            
+            # Resolve selected index early so we can pick the correct time field + sanitization behavior
+            selected_index_id = query_payload.get('index_id', index_id)
+            
+            # Reject multi-index queries - only single index allowed
+            if isinstance(selected_index_id, list):
+                logger.error(f"Multi-index queries are not allowed. Received: {selected_index_id}")
+                selected_index_id = selected_index_id[0] if selected_index_id else index_id
+                query_payload['index_id'] = selected_index_id
+                logger.warning(f"Using single index: {selected_index_id}")
+            elif isinstance(selected_index_id, str) and ',' in selected_index_id:
+                logger.error(f"Multi-index queries are not allowed. Received comma-separated: {selected_index_id}")
+                first_index = selected_index_id.split(',')[0].strip()
+                query_payload['index_id'] = first_index
+                selected_index_id = first_index
+                logger.warning(f"Using single index: {selected_index_id}")
+            
+            # Adjust default time field based on index needs (e.g., monthly activity → completed_on)
+            time_field_override = self._resolve_time_field_for_index(time_field_override, selected_index_id, user_message)
+            
             rating_query = self._is_rating_query(user_message, query_payload)
             sanitize_time_field = 'completed_date' if rating_query else time_field_override
             
@@ -215,6 +240,16 @@ class QueryOrchestrator:
             # Pass time info so date_histogram extended_bounds can always match the requested time window
             # even if the generated query's time range is missing or hard to extract.
             self._sanitize_query_payload(query_payload, time_period=effective_time_period, time_field=sanitize_time_field)
+            
+            # CRITICAL: Validate and remove fields that don't exist in the selected index
+            # This prevents queries from using fields from other indices (e.g., module_status in catalog index)
+            # selected_index_id already resolved above (and query_payload normalized to a single index)
+            
+            # FIRST: Aggressively remove known invalid fields based on index type (safety net)
+            self._remove_known_invalid_fields(query_payload, selected_index_id)
+            
+            # THEN: Validate against schema (more comprehensive)
+            self._validate_and_remove_invalid_fields(query_payload, selected_index_id)
             
             # Replace hardcoded epoch timestamps with date math for relative timeframes
             # This ensures queries use dynamic date math (e.g., "now-3M/M") instead of fixed timestamps
@@ -251,9 +286,9 @@ class QueryOrchestrator:
                 is_module_completion_rate_kpi = False
                 is_user_completion_rate_kpi = True
                 is_single_completion_rate_kpi = True
-            else:
+            
             # Ensure completion rate KPIs wrap pipeline agg inside multi-bucket scope
-                self._ensure_completion_rate_scope_wrapper(query_payload)
+            self._ensure_completion_rate_scope_wrapper(query_payload)
             
             # CRITICAL POST-PROCESSING: Check if LLM generated module_name filter with a person name
             # This catches cases where detection failed but LLM still put person name in module_name
@@ -398,6 +433,12 @@ class QueryOrchestrator:
                 user_message=user_message
             )
             
+            # CRITICAL: Re-validate after applying structured filters
+            # This ensures any fields added by _ensure_module_status_default or other functions
+            # that don't exist in the selected index are removed
+            self._remove_known_invalid_fields(query_payload, selected_index_id)
+            self._validate_and_remove_invalid_fields(query_payload, selected_index_id)
+            
             # CRITICAL: After applying structured filters, remove completed_status and ratings
             # from completion rate queries (they may have been added back by structured filters)
             if is_single_completion_rate_kpi:
@@ -512,18 +553,19 @@ class QueryOrchestrator:
                 (query_payload.get('query', {}) or {}).get('query')
             )
 
-            context.add_query_record(QueryRecord(
-                user_message=user_message,
-                query=query_payload.get('query', {}),
-                result_total=execution_result.get('total', 0),
-                aggregations=execution_result.get('aggregations', {}),
-                response_type=response_type.value,
-                primary_entity_field=primary_field,
-                primary_entity_label=primary_label,
-                primary_entity_count=primary_count,
-                filter_query=filter_query
-            ))
-            context.add_message("assistant", response.get('message', ''))
+            if self.use_conversation_context:
+                context.add_query_record(QueryRecord(
+                    user_message=user_message,
+                    query=query_payload.get('query', {}),
+                    result_total=execution_result.get('total', 0),
+                    aggregations=execution_result.get('aggregations', {}),
+                    response_type=response_type.value,
+                    primary_entity_field=primary_field,
+                    primary_entity_label=primary_label,
+                    primary_entity_count=primary_count,
+                    filter_query=filter_query
+                ))
+                context.add_message("assistant", response.get('message', ''))
             
             # Step 9: Build final response
             # Use response_type from query_payload if available (module intent overrides detection)
@@ -1162,12 +1204,41 @@ class QueryOrchestrator:
         # Build the base filter
         must_filters: List[Dict[str, Any]] = []
         
-        # ALWAYS filter for active users only (user_status = 5)
-        must_filters.append({"term": {"user_status": 5}})
+        # ALWAYS filter for active users only (user_status = 5) - BUT ONLY FOR CONSUMPTION INDEX
+        # CRITICAL: Field name varies by index
+        # - Consumption index uses 'user_status' = 5
+        # - User profile index uses 'status' = 5 (NOT user_status!)
+        # - Catalog index doesn't have user status fields
+        selected_index_id = query_payload.get('index_id') or 'module_consumption_data'  # Default to consumption if not set
+        is_consumption_index = False
+        is_user_profile_index = False
         
-        # ALWAYS filter for assigned records only (assigned_status = 0)
-        # Users can only complete what's assigned to them
-        must_filters.append({"term": {"assigned_status": 0}})
+        if selected_index_id in settings.OPENSEARCH_INDEXES:
+            if selected_index_id == 'module_consumption_data':
+                is_consumption_index = True
+            elif selected_index_id == 'user_profile_data':
+                is_user_profile_index = True
+        else:
+            # Check if it's the actual index name
+            if 'consumption' in str(selected_index_id).lower():
+                is_consumption_index = True
+            elif 'learnbee' in str(selected_index_id).lower() or 'user_summary' in str(selected_index_id).lower():
+                is_user_profile_index = True
+        
+        if is_consumption_index:
+            must_filters.append({"term": {"user_status": 5}})
+            logger.info(f"Added user_status = 5 filter for consumption index")
+        elif is_user_profile_index:
+            must_filters.append({"term": {"status": 5}})
+            logger.info(f"Added status = 5 filter for user profile index")
+        else:
+            logger.info(f"Skipping user status filter - not applicable for index: {selected_index_id}")
+        
+        # ALWAYS filter for assigned records only (assigned_status = 0) - BUT ONLY FOR CONSUMPTION INDEX
+        # Catalog and user profile indices don't have assigned_status
+        if is_consumption_index:
+            # Users can only complete what's assigned to them
+            must_filters.append({"term": {"assigned_status": 0}})
         
         # Detect what metric to count from the message
         metric_type = 'completions'  # default
@@ -1350,9 +1421,42 @@ class QueryOrchestrator:
         # Enforce single-tenant scope (cmid=1)
         self._append_filter_clause(bool_query, {"term": {"cmid": 1}})
         
-        # ALWAYS filter for active users only (user_status = 5)
-        # This is a core business rule - we only report on active users
-        self._append_filter_clause(bool_query, {"term": {"user_status": 5}})
+        # ALWAYS filter for active users only - BUT FIELD NAME VARIES BY INDEX
+        # CRITICAL: 
+        # - Consumption index uses 'user_status' = 5
+        # - User profile index uses 'status' = 5 (NOT user_status!)
+        # - Catalog index doesn't have user status fields
+        selected_index_id = query_payload.get('index_id') or 'module_consumption_data'  # Default to consumption if not set
+        is_consumption_index = False
+        is_user_profile_index = False
+        is_monthly_activity_index = False
+        
+        if selected_index_id in settings.OPENSEARCH_INDEXES:
+            if selected_index_id == 'module_consumption_data':
+                is_consumption_index = True
+            elif selected_index_id == 'user_profile_data':
+                is_user_profile_index = True
+            elif selected_index_id == 'monthly_user_activity_data':
+                is_monthly_activity_index = True
+        else:
+            # Check if it's the actual index name
+            if 'consumption' in str(selected_index_id).lower():
+                is_consumption_index = True
+            elif 'learnbee' in str(selected_index_id).lower() or 'user_summary' in str(selected_index_id).lower():
+                is_user_profile_index = True
+            elif 'monthly_user_activity' in str(selected_index_id).lower():
+                is_monthly_activity_index = True
+        
+        if is_consumption_index:
+            self._append_filter_clause(bool_query, {"term": {"user_status": 5}})
+            logger.info(f"Added user_status = 5 filter for consumption index")
+        elif is_user_profile_index or is_monthly_activity_index:
+            self._append_filter_clause(bool_query, {"term": {"status": 5}})
+            logger.info(
+                f"Added status = 5 filter for {'monthly activity' if is_monthly_activity_index else 'user profile'} index"
+            )
+        else:
+            logger.info(f"Skipping user status filter - not applicable for index: {selected_index_id}")
         
         # Bedrock should have already added assigned_status and completed_status filters if needed
         # based on the query intent. We'll trust Bedrock's judgment here.
@@ -1365,7 +1469,9 @@ class QueryOrchestrator:
         self._convert_module_name_terms_to_match(bool_query)
 
         # Enforce default module_status = 0 when user asks about modules without specifying a different status
-        self._ensure_module_status_default(bool_query, user_message or "")
+        # CRITICAL: Pass index_id to ensure correct field name is used
+        selected_index_id = query_payload.get('index_id') or 'module_consumption_data'  # Default to consumption if not set
+        self._ensure_module_status_default(bool_query, user_message or "", selected_index_id)
 
         if rating_query:
             self._enforce_rating_filters(bool_query)
@@ -1440,6 +1546,65 @@ class QueryOrchestrator:
         existing_bool = search_query.get('bool')
         if isinstance(existing_bool, dict):
             bool_query = existing_bool
+            # CRITICAL: Remove invalid keys from bool query - OpenSearch only allows: must, must_not, should, filter, minimum_should_match, boost
+            valid_bool_keys = {'must', 'must_not', 'should', 'filter', 'minimum_should_match', 'boost'}
+            invalid_keys = [key for key in bool_query.keys() if key not in valid_bool_keys]
+            if invalid_keys:
+                logger.warning(f"Removing invalid keys from bool query: {invalid_keys}")
+                for key in invalid_keys:
+                    bool_query.pop(key, None)
+            # CRITICAL: Check for nested bool queries - OpenSearch doesn't allow bool inside bool directly
+            # If we find a nested bool, we need to flatten it
+            for key in ('filter', 'must', 'should', 'must_not'):
+                value = bool_query.get(key)
+                if isinstance(value, list):
+                    # Check each item for nested bool queries
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict) and 'bool' in item:
+                            # Found a nested bool - flatten it by extracting its clauses
+                            nested_bool = item['bool']
+                            if isinstance(nested_bool, dict):
+                                # Extract clauses from nested bool and add them to the parent
+                                for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                    nested_value = nested_bool.get(nested_key)
+                                    if nested_value:
+                                        if isinstance(nested_value, list):
+                                            # Add all clauses from nested bool to parent
+                                            if key not in bool_query:
+                                                bool_query[key] = []
+                                            bool_query[key].extend(nested_value)
+                                        elif isinstance(nested_value, dict):
+                                            # Single clause - add it
+                                            if key not in bool_query:
+                                                bool_query[key] = []
+                                            bool_query[key].append(nested_value)
+                                # Remove the nested bool item
+                                value.pop(i)
+                                # If there are other keys in the item besides 'bool', keep them
+                                item.pop('bool')
+                                if item:
+                                    # If item still has other keys, add it back
+                                    value.insert(i, item)
+                                break
+                elif isinstance(value, dict) and 'bool' in value:
+                    # Single dict with nested bool - flatten it
+                    nested_bool = value['bool']
+                    if isinstance(nested_bool, dict):
+                        # Extract clauses from nested bool
+                        for nested_key in ('filter', 'must', 'should', 'must_not'):
+                            nested_value = nested_bool.get(nested_key)
+                            if nested_value:
+                                if isinstance(nested_value, list):
+                                    bool_query[nested_key] = nested_value
+                                elif isinstance(nested_value, dict):
+                                    bool_query[nested_key] = [nested_value]
+                        # Remove the nested bool
+                        value.pop('bool')
+                        if value:
+                            # If there are other keys, add them to filter
+                            if 'filter' not in bool_query:
+                                bool_query['filter'] = []
+                            bool_query['filter'].append(value)
         else:
             previous = copy.deepcopy(search_query)
             search_query.clear()
@@ -1451,14 +1616,34 @@ class QueryOrchestrator:
         for key in ('filter', 'must', 'should', 'must_not'):
             value = bool_query.get(key)
             if isinstance(value, list):
-                # Clean the list - remove invalid entries
+                # Clean the list - remove invalid entries and nested bool queries
                 cleaned = []
                 for item in value:
                     # Only keep valid query clauses (dicts that aren't empty)
                     if isinstance(item, dict) and item:
                         # Remove any invalid/empty clauses
                         if item != {} and item != {"match_all": {}}:
-                            cleaned.append(item)
+                            # Check for nested bool and flatten it
+                            if 'bool' in item:
+                                nested_bool = item['bool']
+                                if isinstance(nested_bool, dict):
+                                    # Flatten nested bool clauses into parent
+                                    for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                        nested_value = nested_bool.get(nested_key)
+                                        if nested_value:
+                                            if isinstance(nested_value, list):
+                                                cleaned.extend(nested_value)
+                                            elif isinstance(nested_value, dict):
+                                                cleaned.append(nested_value)
+                                    # Remove bool key
+                                    item.pop('bool')
+                                    # If item still has other keys, add them
+                                    if item:
+                                        cleaned.append(item)
+                                else:
+                                    cleaned.append(item)
+                            else:
+                                cleaned.append(item)
                 bool_query[key] = cleaned
                 continue
             if value is None:
@@ -1466,13 +1651,173 @@ class QueryOrchestrator:
             elif isinstance(value, dict):
                 # Convert single dict to list, but only if it's valid
                 if value and value != {"match_all": {}}:
-                    bool_query[key] = [value]
+                    # Check for nested bool
+                    if 'bool' in value:
+                        nested_bool = value['bool']
+                        if isinstance(nested_bool, dict):
+                            # Flatten nested bool
+                            for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                nested_value = nested_bool.get(nested_key)
+                                if nested_value:
+                                    if isinstance(nested_value, list):
+                                        bool_query[nested_key] = nested_value
+                                    elif isinstance(nested_value, dict):
+                                        bool_query[nested_key] = [nested_value]
+                            value.pop('bool')
+                            if value:
+                                bool_query[key] = [value]
+                            else:
+                                bool_query[key] = []
+                        else:
+                            bool_query[key] = [value]
+                    else:
+                        bool_query[key] = [value]
                 else:
                     bool_query[key] = []
             else:
                 # Invalid type, set to empty list
                 bool_query[key] = []
         return bool_query
+    
+    def _validate_and_fix_bool_queries(self, query_payload: Dict[str, Any]):
+        """
+        Recursively validate and fix bool query structures to prevent parsing errors.
+        Removes invalid keys, flattens nested bool queries, and ensures all clauses are valid query types.
+        """
+        # Valid query clause types that can appear in bool.filter, bool.must, etc.
+        valid_query_types = {
+            'term', 'terms', 'range', 'match', 'match_phrase', 'match_phrase_prefix',
+            'exists', 'missing', 'prefix', 'wildcard', 'regexp', 'fuzzy', 'ids',
+            'type', 'bool', 'match_all', 'match_none', 'multi_match', 'query_string',
+            'simple_query_string', 'common', 'more_like_this', 'script', 'geo_shape',
+            'geo_bounding_box', 'geo_distance', 'geo_polygon', 'nested', 'has_child',
+            'has_parent', 'function_score', 'boosting', 'constant_score', 'dis_max'
+        }
+        
+        def is_valid_query_clause(obj: Any) -> bool:
+            """Check if an object is a valid query clause."""
+            if not isinstance(obj, dict):
+                return False
+            # Must have at least one valid query type key
+            return any(key in valid_query_types for key in obj.keys())
+        
+        def fix_bool_query_recursive(obj: Any, path: str = ""):
+            """Recursively find and fix bool queries."""
+            if isinstance(obj, dict):
+                # Check if this is a bool query
+                if 'bool' in obj:
+                    bool_query = obj['bool']
+                    if isinstance(bool_query, dict):
+                        # Remove invalid keys
+                        valid_bool_keys = {'must', 'must_not', 'should', 'filter', 'minimum_should_match', 'boost'}
+                        invalid_keys = [key for key in bool_query.keys() if key not in valid_bool_keys]
+                        if invalid_keys:
+                            logger.warning(f"Removing invalid keys from bool query at {path}: {invalid_keys}")
+                            for key in invalid_keys:
+                                bool_query.pop(key, None)
+                        
+                        # Check for nested bool queries in filter/must/should/must_not
+                        for key in ('filter', 'must', 'should', 'must_not'):
+                            value = bool_query.get(key)
+                            if isinstance(value, list):
+                                # Check each item for nested bool or invalid structures
+                                new_items = []
+                                for item in value:
+                                    if isinstance(item, dict):
+                                        # Check if item is a valid query clause
+                                        if not is_valid_query_clause(item):
+                                            # Invalid structure - try to fix it
+                                            if 'query' in item:
+                                                # Extract nested query
+                                                nested_query = item.pop('query')
+                                                if isinstance(nested_query, dict) and is_valid_query_clause(nested_query):
+                                                    new_items.append(nested_query)
+                                                elif isinstance(nested_query, dict) and 'bool' in nested_query:
+                                                    # Extract bool clauses
+                                                    nested_bool = nested_query['bool']
+                                                    if isinstance(nested_bool, dict):
+                                                        for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                                            nested_value = nested_bool.get(nested_key)
+                                                            if nested_value:
+                                                                if isinstance(nested_value, list):
+                                                                    new_items.extend(nested_value)
+                                                                elif isinstance(nested_value, dict) and is_valid_query_clause(nested_value):
+                                                                    new_items.append(nested_value)
+                                                # If item still has other keys, log warning
+                                                if item:
+                                                    logger.warning(f"Removed invalid query structure at {path}.{key}, remaining keys: {list(item.keys())}")
+                                            elif 'bool' in item:
+                                                # Nested bool - flatten it
+                                                nested_bool = item.pop('bool')
+                                                if isinstance(nested_bool, dict):
+                                                    # Extract clauses from nested bool
+                                                    for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                                        nested_value = nested_bool.get(nested_key)
+                                                        if nested_value:
+                                                            if isinstance(nested_value, list):
+                                                                new_items.extend([v for v in nested_value if isinstance(v, dict) and is_valid_query_clause(v)])
+                                                            elif isinstance(nested_value, dict) and is_valid_query_clause(nested_value):
+                                                                new_items.append(nested_value)
+                                                    # If item has other keys, keep them (but it should be empty now)
+                                                    if item:
+                                                        logger.warning(f"Flattened nested bool at {path}.{key}, remaining keys: {list(item.keys())}")
+                                            else:
+                                                # Invalid structure - log and skip
+                                                logger.warning(f"Skipping invalid query clause at {path}.{key}: {list(item.keys())}")
+                                                continue
+                                        else:
+                                            # Valid query clause - check for nested bool
+                                            if 'bool' in item:
+                                                # Recursively fix nested bool
+                                                fix_bool_query_recursive(item, f"{path}.{key}")
+                                            new_items.append(item)
+                                    else:
+                                        # Non-dict item - skip (invalid)
+                                        logger.warning(f"Skipping non-dict item at {path}.{key}: {type(item)}")
+                                bool_query[key] = new_items
+                            elif isinstance(value, dict):
+                                # Single dict - check if it's valid
+                                if not is_valid_query_clause(value):
+                                    # Try to fix it
+                                    if 'query' in value:
+                                        nested_query = value.pop('query')
+                                        if isinstance(nested_query, dict) and is_valid_query_clause(nested_query):
+                                            bool_query[key] = [nested_query]
+                                        elif isinstance(nested_query, dict) and 'bool' in nested_query:
+                                            nested_bool = nested_query['bool']
+                                            if isinstance(nested_bool, dict):
+                                                for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                                    nested_value = nested_bool.get(nested_key)
+                                                    if nested_value:
+                                                        if isinstance(nested_value, list):
+                                                            bool_query[nested_key] = [v for v in nested_value if isinstance(v, dict) and is_valid_query_clause(v)]
+                                                        elif isinstance(nested_value, dict) and is_valid_query_clause(nested_value):
+                                                            bool_query[nested_key] = [nested_value]
+                                    elif 'bool' in value:
+                                        nested_bool = value.pop('bool')
+                                        if isinstance(nested_bool, dict):
+                                            for nested_key in ('filter', 'must', 'should', 'must_not'):
+                                                nested_value = nested_bool.get(nested_key)
+                                                if nested_value:
+                                                    if isinstance(nested_value, list):
+                                                        bool_query[nested_key] = [v for v in nested_value if isinstance(v, dict) and is_valid_query_clause(v)]
+                                                    elif isinstance(nested_value, dict) and is_valid_query_clause(nested_value):
+                                                        bool_query[nested_key] = [nested_value]
+                                else:
+                                    # Valid - convert to list
+                                    bool_query[key] = [value]
+                
+                # Recursively check all nested structures
+                for key, val in obj.items():
+                    fix_bool_query_recursive(val, f"{path}.{key}" if path else key)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    fix_bool_query_recursive(item, f"{path}[{i}]" if path else f"[{i}]")
+        
+        # Start validation from the query object
+        query_body = query_payload.get('query', {})
+        if query_body:
+            fix_bool_query_recursive(query_body, "query")
 
     def _ensure_time_filter_clause(
         self,
@@ -1518,13 +1863,13 @@ class QueryOrchestrator:
         else:
             # Use epoch timestamps for absolute dates or when date math not applicable
             range_clause = {
-                "range": {
-                    normalized_field: {
-                        "gte": time_period.start_timestamp,
-                        end_key: time_period.end_timestamp
-                    }
+            "range": {
+                normalized_field: {
+                    "gte": time_period.start_timestamp,
+                    end_key: time_period.end_timestamp
                 }
             }
+        }
 
         filter_list = bool_query.setdefault('filter', [])
         if not isinstance(filter_list, list):
@@ -1532,6 +1877,61 @@ class QueryOrchestrator:
 
         if not self._filter_exists(filter_list, range_clause):
             filter_list.append(range_clause)
+
+    def _is_monthly_activity_index(self, index_id: Optional[str]) -> bool:
+        """True if the index refers to the monthly per-user activity summary index."""
+        if not index_id:
+            return False
+        # Index ID (key)
+        if index_id in settings.OPENSEARCH_INDEXES:
+            return index_id == 'monthly_user_activity_data'
+        # Actual index name (value)
+        return 'monthly_user_activity' in str(index_id).lower()
+
+    def _resolve_time_field_for_index(
+        self,
+        requested_field: Optional[str],
+        index_id: Optional[str],
+        user_message: str = ""
+    ) -> str:
+        """
+        Determine which time field should be used as the default/fallback based on the selected index.
+        
+        For MONTHLY USER ACTIVITY index:
+        - Activity month questions → completed_on (epoch)
+        - Operational freshness → updated_on / last_updated
+        - Convert completion-oriented hints (completed_date) → completed_on
+        """
+        field = requested_field or 'created_on'
+        if not index_id:
+            return field
+        
+        if not self._is_monthly_activity_index(index_id):
+            return field
+        
+        msg = (user_message or "").lower()
+        
+        # Operational freshness / sync questions
+        if any(k in msg for k in ['last sync', 'sync time', 'last_updated', 'last updated', 'synced']):
+            return 'last_updated'
+        if any(k in msg for k in ['updated', 'modified', 'changed']):
+            return 'updated_on'
+        
+        # If the user is explicitly asking about account creation, keep created_on
+        if any(k in msg for k in ['user created', 'account created', 'signup', 'signed up', 'registered', 'registration']):
+            return 'created_on'
+        
+        # Map completion-style hint to monthly activity time anchor
+        if field == 'completed_date':
+            return 'completed_on'
+        if field == 'user_created_on':
+            return 'created_on'
+        
+        # Default for monthly activity questions
+        if field == 'created_on':
+            return 'completed_on'
+        
+        return field
 
     def _validate_bool_query(self, query: Dict[str, Any]):
         """Validate and clean bool query structure to prevent parsing errors."""
@@ -3291,7 +3691,7 @@ class QueryOrchestrator:
                 filter_clauses = bool_query.get('filter', [])
                 if isinstance(filter_clauses, list):
                     # Count how many filters we have and what they are
-                    allowed_fields = {'user_status', 'cmid'}
+                    allowed_fields = {'user_status', 'status', 'cmid'}
                     for clause in filter_clauses:
                         if isinstance(clause, dict) and 'term' in clause:
                             term_dict = clause.get('term', {})
@@ -3698,6 +4098,613 @@ class QueryOrchestrator:
         self._remove_terms_lookup_recursive(query_payload)
         # Fix date histograms to ensure all days are included
         self._fix_date_histograms(query_payload, time_period=time_period, time_field=time_field)
+        # CRITICAL: Validate and fix bool query structures to prevent "Unknown key" errors
+        self._validate_and_fix_bool_queries(query_payload)
+    
+    def _validate_and_remove_invalid_fields(
+        self,
+        query_payload: Dict[str, Any],
+        index_id: str
+    ):
+        """
+        Validate that all fields in the query exist in the selected index schema.
+        Remove any filters/clauses that reference fields not in the schema.
+        
+        Args:
+            query_payload: The query payload to validate
+            index_id: The index ID to validate against
+        """
+        # Get schema for the selected index
+        # Handle both index ID (key) and actual index name (value)
+        schema = None
+        actual_index_id = index_id  # Default to provided index_id
+        
+        if index_id in self.schema_cache:
+            schema = self.schema_cache[index_id]
+            actual_index_id = index_id
+        else:
+            # Try to find by actual index name
+            for key, value in settings.OPENSEARCH_INDEXES.items():
+                if value == index_id:
+                    schema = self.schema_cache.get(key)
+                    if schema:
+                        actual_index_id = key
+                        logger.info(f"Mapped index name '{index_id}' to index ID '{key}' for validation")
+                        break
+        
+        if not schema:
+            logger.warning(f"Schema not found for index '{index_id}', skipping field validation. Available: {list(self.schema_cache.keys())}")
+            return
+        
+        # Extract all available field names from schema
+        fields = schema.get('fields', [])
+        available_fields = {field.get('name', '') for field in fields}
+        
+        # Also add .keyword versions for keyword/text fields (OpenSearch automatically creates these)
+        # This allows queries to use either "field" or "field.keyword" for aggregations
+        for field in fields:
+            field_name = field.get('name', '')
+            field_type = field.get('type', '')
+            if field_type in ['keyword', 'text'] and field_name:
+                available_fields.add(f"{field_name}.keyword")
+        
+        # Also include common OpenSearch fields that are always available
+        available_fields.update(['_id', '_score', '_source', '_index', '_type'])
+        
+        logger.info(f"Validating query fields against index {index_id}. Available fields: {len(available_fields)}")
+        logger.debug(f"Sample available fields: {sorted(list(available_fields))[:30]}")
+        
+        # Track removed fields for logging
+        removed_fields = set()
+        
+        # Recursively validate and remove invalid field references
+        def validate_and_remove(obj: Any, path: str = "") -> bool:
+            """Recursively validate fields and remove invalid ones. Returns True if object was modified."""
+            modified = False
+            
+            if isinstance(obj, dict):
+                keys_to_remove = []
+                
+                for key, value in list(obj.items()):
+                    current_path = f"{path}.{key}" if path else key
+                    
+                    # Check if this is a field reference in a query clause
+                    # Common patterns: {"term": {"field_name": value}}, {"range": {"field_name": {...}}}, etc.
+                    # CRITICAL: Only validate if this is actually a query clause, not an aggregation config
+                    # Aggregation configs have keys like "field", "size", "order" which are NOT index fields
+                    if key in ['term', 'terms', 'range', 'match', 'match_phrase', 'exists', 'missing', 'prefix', 'wildcard', 'regexp']:
+                        if isinstance(value, dict):
+                            # This is a field reference - check if field exists
+                            # BUT: Skip if we're inside an aggregation definition (terms, cardinality, etc.)
+                            # because those have config keys that aren't field names
+                            # Check if path contains aggregation config (e.g., "aggs.designations.terms")
+                            # If we're inside a terms/cardinality/etc. config, the keys (field, size, order) are NOT field names
+                            is_agg_config = False
+                            if path:
+                                path_parts = path.split('.')
+                                # Check if we're inside an aggregation config (terms, cardinality, etc.)
+                                # Pattern: "aggs.designations.terms" or "query.aggs.designations.terms"
+                                for i, part in enumerate(path_parts):
+                                    if part in ['terms', 'cardinality', 'avg', 'sum', 'min', 'max', 'stats', 'value_count', 'date_histogram']:
+                                        # We're inside an aggregation config - keys like "field", "size", "order" are config, not field names
+                                        is_agg_config = True
+                                        break
+                            
+                            if not is_agg_config:
+                                for field_name in list(value.keys()):
+                                    if field_name not in available_fields:
+                                        logger.warning(f"Removing invalid field '{field_name}' from {current_path} (not in index {index_id})")
+                                        removed_fields.add(field_name)
+                                        value.pop(field_name, None)
+                                        modified = True
+                                        # If this was the only field, remove the entire clause
+                                        if not value:
+                                            keys_to_remove.append(key)
+                    
+                    # CRITICAL: Check inside bool query clauses (filter, must, should, must_not)
+                    # These contain arrays of query clauses that need validation
+                    elif key in ['filter', 'must', 'should', 'must_not']:
+                        if isinstance(value, list):
+                            items_to_remove = []
+                            for i, item in enumerate(value):
+                                if isinstance(item, dict):
+                                    # Check if this item is a query clause with a field reference
+                                    # Pattern: {"term": {"field_name": value}}
+                                    for clause_type in ['term', 'terms', 'range', 'match', 'match_phrase', 'exists', 'missing', 'prefix', 'wildcard', 'regexp']:
+                                        if clause_type in item:
+                                            clause_value = item[clause_type]
+                                            if isinstance(clause_value, dict):
+                                                # Check each field in the clause
+                                                for field_name in list(clause_value.keys()):
+                                                    if field_name not in available_fields:
+                                                        logger.warning(f"Removing invalid field '{field_name}' from {current_path}[{i}].{clause_type} (not in index {index_id})")
+                                                        removed_fields.add(field_name)
+                                                        clause_value.pop(field_name, None)
+                                                        modified = True
+                                                        # If clause is now empty, mark for removal
+                                                        if not clause_value:
+                                                            items_to_remove.append(i)
+                                                            break
+                                    
+                                    # Also recursively check nested bool queries
+                                    if 'bool' in item:
+                                        if validate_and_remove(item['bool'], f"{current_path}[{i}].bool"):
+                                            modified = True
+                            
+                            # Remove empty items (in reverse order to maintain indices)
+                            for i in reversed(items_to_remove):
+                                value.pop(i)
+                                modified = True
+                    
+                    # Check bool queries recursively
+                    elif key == 'bool':
+                        if validate_and_remove(value, current_path):
+                            modified = True
+                    
+                    # Check aggregations - field references in aggregations
+                    elif key == 'aggs' or key == 'aggregations':
+                        if isinstance(value, dict):
+                            # Collect names of aggregations we're about to remove
+                            removed_agg_names = set()
+                            
+                            for agg_name, agg_def in value.items():
+                                if isinstance(agg_def, dict):
+                                    # Check terms aggregation field
+                                    if 'terms' in agg_def:
+                                        terms_def = agg_def['terms']
+                                        if isinstance(terms_def, dict) and 'field' in terms_def:
+                                            field_name = terms_def['field']
+                                            # Handle .keyword fields - check base field name
+                                            base_field_name = field_name.replace('.keyword', '')
+                                            if base_field_name not in available_fields:
+                                                logger.warning(f"Removing invalid field '{field_name}' from aggregation '{agg_name}.terms.field' (not in index {index_id})")
+                                                removed_fields.add(field_name)
+                                                keys_to_remove.append(agg_name)
+                                                removed_agg_names.add(agg_name)
+                                                modified = True
+                                            elif field_name != base_field_name and base_field_name in available_fields:
+                                                # Field exists but .keyword version doesn't - use base field
+                                                logger.info(f"Replacing '{field_name}' with '{base_field_name}' in aggregation '{agg_name}.terms.field'")
+                                                terms_def['field'] = base_field_name
+                                                modified = True
+                                    
+                                    # Check cardinality aggregation field
+                                    if 'cardinality' in agg_def:
+                                        card_def = agg_def['cardinality']
+                                        if isinstance(card_def, dict) and 'field' in card_def:
+                                            field_name = card_def['field']
+                                            # Handle .keyword fields
+                                            base_field_name = field_name.replace('.keyword', '')
+                                            if base_field_name not in available_fields:
+                                                logger.warning(f"Removing invalid field '{field_name}' from aggregation '{agg_name}.cardinality.field' (not in index {index_id})")
+                                                removed_fields.add(field_name)
+                                                keys_to_remove.append(agg_name)
+                                                removed_agg_names.add(agg_name)
+                                                modified = True
+                                    
+                                    # Check other aggregation types with field references
+                                    for agg_type in ['avg', 'sum', 'min', 'max', 'stats', 'value_count', 'date_histogram']:
+                                        if agg_type in agg_def:
+                                            agg_type_def = agg_def[agg_type]
+                                            if isinstance(agg_type_def, dict) and 'field' in agg_type_def:
+                                                field_name = agg_type_def['field']
+                                                # Handle .keyword fields
+                                                base_field_name = field_name.replace('.keyword', '')
+                                                if base_field_name not in available_fields:
+                                                    logger.warning(f"Removing invalid field '{field_name}' from aggregation '{agg_name}.{agg_type}.field' (not in index {index_id})")
+                                                    removed_fields.add(field_name)
+                                                    keys_to_remove.append(agg_name)
+                                                    removed_agg_names.add(agg_name)
+                                                    modified = True
+                                    
+                                    # CRITICAL: Check if aggregation definition became empty after field removal
+                                    # If so, remove the entire aggregation to prevent "Missing definition" errors
+                                    if not agg_def or (isinstance(agg_def, dict) and not agg_def):
+                                        logger.warning(f"Removing empty aggregation '{agg_name}' (definition became empty after field removal)")
+                                        keys_to_remove.append(agg_name)
+                                        removed_agg_names.add(agg_name)
+                                        modified = True
+                                    else:
+                                        # Recursively check nested aggregations (aggs inside this aggregation)
+                                        # BUT: Don't recursively validate aggregation config (terms, cardinality, etc.)
+                                        # because those contain config keys (field, size, order) that aren't index fields
+                                        if 'aggs' in agg_def or 'aggregations' in agg_def:
+                                            nested_aggs = agg_def.get('aggs') or agg_def.get('aggregations')
+                                            if isinstance(nested_aggs, dict):
+                                                if validate_and_remove({'aggs': nested_aggs}, f"{current_path}.{agg_name}.aggs"):
+                                                    modified = True
+                                        # Don't recursively validate the aggregation config itself (terms, cardinality, etc.)
+                                        # because those have config keys like "field", "size", "order" that aren't field names
+                            
+                            # CRITICAL: After identifying removed aggregations, check for orphaned bucket_scripts
+                            # that reference the removed aggregations
+                            for agg_name, agg_def in list(value.items()):
+                                if agg_name in removed_agg_names:
+                                    continue  # Skip aggregations we're already removing
+                                if isinstance(agg_def, dict):
+                                    # Check for bucket_script that references removed aggregations
+                                    if 'bucket_script' in agg_def:
+                                        bucket_script = agg_def['bucket_script']
+                                        if isinstance(bucket_script, dict) and 'buckets_path' in bucket_script:
+                                            buckets_path = bucket_script['buckets_path']
+                                            if isinstance(buckets_path, dict):
+                                                # Check if any referenced aggregation was removed
+                                                for path_key, path_value in list(buckets_path.items()):
+                                                    # Extract aggregation name from path (e.g., "agg_name>sub_agg")
+                                                    referenced_agg = path_value.split('>')[0] if '>' in path_value else path_value
+                                                    if referenced_agg in removed_agg_names:
+                                                        logger.warning(f"Removing bucket_script '{agg_name}' - references removed aggregation '{referenced_agg}'")
+                                                        keys_to_remove.append(agg_name)
+                                                        modified = True
+                                                        break
+                    
+                    # Check _source fields
+                    elif key == '_source':
+                        if isinstance(value, list):
+                            # Remove fields that don't exist in schema
+                            original_fields = set(value)
+                            value[:] = [field for field in value if field in available_fields]
+                            removed = original_fields - available_fields
+                            if removed:
+                                for field in removed:
+                                    logger.warning(f"Removing invalid field '{field}' from _source (not in index {index_id})")
+                                    removed_fields.add(field)
+                                modified = True
+                    
+                    # Check sort fields
+                    elif key == 'sort':
+                        if isinstance(value, list):
+                            for sort_item in value:
+                                if isinstance(sort_item, dict):
+                                    for sort_field in list(sort_item.keys()):
+                                        if sort_field not in available_fields and sort_field not in ['_score', '_doc']:
+                                            logger.warning(f"Removing invalid sort field '{sort_field}' (not in index {index_id})")
+                                            removed_fields.add(sort_field)
+                                            sort_item.pop(sort_field, None)
+                                            modified = True
+                    
+                    # CRITICAL: Check inside bool query clauses (filter, must, should, must_not)
+                    # These contain arrays of query clauses that need validation
+                    elif key in ['filter', 'must', 'should', 'must_not']:
+                        if isinstance(value, list):
+                            items_to_remove = []
+                            for i, item in enumerate(value):
+                                if isinstance(item, dict):
+                                    # Check if this item is a query clause with a field reference
+                                    # Pattern: {"term": {"field_name": value}}
+                                    for clause_type in ['term', 'terms', 'range', 'match', 'match_phrase', 'exists', 'missing', 'prefix', 'wildcard', 'regexp']:
+                                        if clause_type in item:
+                                            clause_value = item[clause_type]
+                                            if isinstance(clause_value, dict):
+                                                # Check each field in the clause
+                                                for field_name in list(clause_value.keys()):
+                                                    if field_name not in available_fields:
+                                                        logger.warning(f"Removing invalid field '{field_name}' from {current_path}[{i}].{clause_type} (not in index {index_id})")
+                                                        removed_fields.add(field_name)
+                                                        clause_value.pop(field_name, None)
+                                                        modified = True
+                                                        # If clause is now empty, mark for removal
+                                                        if not clause_value:
+                                                            items_to_remove.append(i)
+                                                            break
+                                    
+                                    # Also recursively check nested bool queries
+                                    if 'bool' in item:
+                                        if validate_and_remove(item['bool'], f"{current_path}[{i}].bool"):
+                                            modified = True
+                            
+                            # Remove empty items (in reverse order to maintain indices)
+                            for i in reversed(items_to_remove):
+                                value.pop(i)
+                                modified = True
+                    
+                    # Check bool queries recursively
+                    elif key == 'bool':
+                        if validate_and_remove(value, current_path):
+                            modified = True
+                    
+                    # Recursively validate nested structures
+                    # BUT: Skip recursive validation for aggregation configs (terms, cardinality, etc.)
+                    # because those contain config keys (field, size, order) that aren't field names
+                    else:
+                        # Check if we're inside an aggregation config - if so, don't recursively validate
+                        # Aggregation configs have keys like "field", "size", "order" that aren't index fields
+                        is_agg_config_key = key in ['terms', 'cardinality', 'avg', 'sum', 'min', 'max', 'stats', 'value_count', 'date_histogram', 'bucket_script', 'bucket_selector', 'top_hits']
+                        if not is_agg_config_key:
+                            if validate_and_remove(value, current_path):
+                                modified = True
+                
+                # Remove empty clauses and aggregations
+                for key_to_remove in keys_to_remove:
+                    obj.pop(key_to_remove, None)
+                    if keys_to_remove:
+                        modified = True
+            
+            elif isinstance(obj, list):
+                items_to_remove = []
+                for i, item in enumerate(obj):
+                    if validate_and_remove(item, f"{path}[{i}]"):
+                        modified = True
+                        # If item became empty dict, mark for removal
+                        if isinstance(item, dict) and not item:
+                            items_to_remove.append(i)
+                
+                # Remove empty items (in reverse order to maintain indices)
+                for i in reversed(items_to_remove):
+                    obj.pop(i)
+                    modified = True
+            
+            return modified
+        
+        # Validate the entire query payload
+        # Start from the query object to catch nested structures in bool.filter, etc.
+        query_obj = query_payload.get('query', {})
+        if query_obj:
+            validate_and_remove(query_obj, "query")
+        
+        # Also validate _source and sort at root level
+        if '_source' in query_payload:
+            validate_and_remove({'_source': query_payload['_source']}, "")
+        if 'sort' in query_payload:
+            validate_and_remove({'sort': query_payload['sort']}, "")
+        
+        if removed_fields:
+            logger.warning(f"Removed {len(removed_fields)} invalid field(s) from query: {removed_fields}")
+        else:
+            logger.info(f"Query validation passed - all fields exist in index {actual_index_id}")
+    
+    def _remove_known_invalid_fields(
+        self,
+        query_payload: Dict[str, Any],
+        index_id: str
+    ):
+        """
+        Aggressively remove known invalid fields based on index type.
+        This is a safety net to catch fields that shouldn't exist in specific indices.
+        
+        Args:
+            query_payload: The query payload to clean
+            index_id: The index ID (key from OPENSEARCH_INDEXES)
+        """
+        # Map index IDs to their invalid fields
+        invalid_fields_map = {
+            'module_catalog_data': {
+                # Catalog index does NOT have these fields
+                'invalid_fields': ['module_status', 'user_status', 'assigned_status', 'completed_status', 
+                                 'completed_date', 'complete_percentage', 'complete_type', 'complete_version',
+                                 'comments', 'invited_date', 'invited_time', 'ratings'],
+                'correct_field': {'module_status': 'status'}  # module_status should be 'status'
+            },
+            'user_profile_data': {
+                # User profile index does NOT have these fields
+                'invalid_fields': ['module_status', 'assigned_status', 'completed_status',
+                                 'completed_date', 'complete_percentage', 'module_name', 'mid',
+                                 'published_date', 'estd_time', 'module_points', 'ratings'],
+                'correct_field': {'user_status': 'status'}  # Convert user_status to status for user profile index
+            },
+            'monthly_user_activity_data': {
+                # Monthly user activity index stores MONTHLY per-user COUNTS/POINTS (not event-level completions)
+                'invalid_fields': ['module_status', 'assigned_status', 'completed_status',
+                                 'complete_percentage', 'complete_type', 'complete_version', 'comments',
+                                 'module_name', 'mid', 'published_date', 'estd_time', 'module_points',
+                                 'ratings', 'invited_date', 'invited_time'],
+                'correct_field': {
+                    'user_status': 'status',
+                    'completed_date': 'completed_on',
+                    'uid': 'id'
+                }
+            },
+            'module_consumption_data': {
+                # Consumption index has module_status and user_status, but NOT plain 'status'
+                'invalid_fields': ['status'],  # Only if it's used for module/user status
+                'correct_field': {}
+            }
+        }
+        
+        config = invalid_fields_map.get(index_id)
+        if not config:
+            # Try to find by actual index name
+            for key, value in settings.OPENSEARCH_INDEXES.items():
+                if value == index_id:
+                    config = invalid_fields_map.get(key)
+                    if config:
+                        index_id = key
+                        break
+        
+        if not config:
+            return
+        
+        invalid_fields = config.get('invalid_fields', [])
+        correct_field_map = config.get('correct_field', {})
+        
+        removed_count = 0
+        
+        def remove_invalid_fields_recursive(obj: Any, path: str = "") -> int:
+            """Recursively remove invalid fields. Returns count of removed fields."""
+            count = 0
+            
+            if isinstance(obj, dict):
+                keys_to_remove = []
+                
+                for key, value in list(obj.items()):
+                    current_path = f"{path}.{key}" if path else key
+                    
+                    # Replace field aliases in aggregation configs, collapse, _source, sort, etc.
+                    # (Needed for monthly_user_activity_data where the user id field is "id" and time anchor is "completed_on")
+                    if key in ['terms', 'cardinality', 'avg', 'sum', 'min', 'max', 'stats', 'value_count', 'date_histogram']:
+                        if isinstance(value, dict) and isinstance(value.get('field'), str):
+                            field_value = value.get('field')
+                            if field_value in correct_field_map:
+                                correct_field = correct_field_map[field_value]
+                                logger.warning(f"REPLACING field '{field_value}' with '{correct_field}' in {current_path}.field")
+                                value['field'] = correct_field
+                                count += 1
+                    
+                    if key == 'collapse' and isinstance(value, dict) and isinstance(value.get('field'), str):
+                        field_value = value.get('field')
+                        if field_value in correct_field_map:
+                            correct_field = correct_field_map[field_value]
+                            logger.warning(f"REPLACING collapse field '{field_value}' with '{correct_field}' in {current_path}.field")
+                            value['field'] = correct_field
+                            count += 1
+                    
+                    if key == '_source' and isinstance(value, list):
+                        new_source = []
+                        for f in value:
+                            if isinstance(f, str) and f in correct_field_map:
+                                new_source.append(correct_field_map[f])
+                                count += 1
+                            else:
+                                new_source.append(f)
+                        obj[key] = new_source
+                    
+                    if key == 'sort' and isinstance(value, list):
+                        for i, sort_item in enumerate(value):
+                            if isinstance(sort_item, dict):
+                                for sort_field in list(sort_item.keys()):
+                                    if sort_field in correct_field_map:
+                                        correct_field = correct_field_map[sort_field]
+                                        sort_item[correct_field] = sort_item.pop(sort_field)
+                                        logger.warning(f"REPLACING sort field '{sort_field}' with '{correct_field}' in {current_path}[{i}]")
+                                        count += 1
+                    
+                    # Check query clauses (term, range, etc.)
+                    if key in ['term', 'terms', 'range', 'match', 'match_phrase']:
+                        if isinstance(value, dict):
+                            for field_name in list(value.keys()):
+                                if field_name in invalid_fields:
+                                    logger.warning(f"AGGRESSIVELY REMOVING invalid field '{field_name}' from {current_path} (not in {index_id})")
+                                    value.pop(field_name, None)
+                                    count += 1
+                                    if not value:
+                                        keys_to_remove.append(key)
+                                elif field_name in correct_field_map:
+                                    # Replace with correct field name
+                                    correct_field = correct_field_map[field_name]
+                                    logger.warning(f"REPLACING '{field_name}' with '{correct_field}' in {current_path}")
+                                    value[correct_field] = value.pop(field_name)
+                                    count += 1
+                    
+                    # Check filter/must/should/must_not arrays
+                    elif key in ['filter', 'must', 'should', 'must_not']:
+                        if isinstance(value, list):
+                            items_to_remove = []
+                            for i, item in enumerate(value):
+                                if isinstance(item, dict):
+                                    for clause_type in ['term', 'terms', 'range', 'match', 'match_phrase']:
+                                        if clause_type in item:
+                                            clause_value = item[clause_type]
+                                            if isinstance(clause_value, dict):
+                                                for field_name in list(clause_value.keys()):
+                                                    if field_name in invalid_fields:
+                                                        logger.warning(f"AGGRESSIVELY REMOVING invalid field '{field_name}' from {current_path}[{i}].{clause_type} (not in {index_id})")
+                                                        clause_value.pop(field_name, None)
+                                                        count += 1
+                                                        if not clause_value:
+                                                            items_to_remove.append(i)
+                                                            break
+                                                    elif field_name in correct_field_map:
+                                                        correct_field = correct_field_map[field_name]
+                                                        logger.warning(f"REPLACING '{field_name}' with '{correct_field}' in {current_path}[{i}].{clause_type}")
+                                                        clause_value[correct_field] = clause_value.pop(field_name)
+                                                        count += 1
+                                    
+                                    # Recursively check nested bool queries
+                                    if 'bool' in item:
+                                        count += remove_invalid_fields_recursive(item['bool'], f"{current_path}[{i}].bool")
+                            
+                            # Remove empty items
+                            for i in reversed(items_to_remove):
+                                value.pop(i)
+                    
+                    # Check bool queries
+                    elif key == 'bool':
+                        count += remove_invalid_fields_recursive(value, current_path)
+                    
+                    # Check aggregations
+                    elif key == 'aggs' or key == 'aggregations':
+                        if isinstance(value, dict):
+                            for agg_name, agg_def in value.items():
+                                if isinstance(agg_def, dict):
+                                    # Check terms.field, cardinality.field, etc.
+                                    for agg_type in ['terms', 'cardinality', 'avg', 'sum', 'min', 'max', 'date_histogram']:
+                                        if agg_type in agg_def:
+                                            agg_type_def = agg_def[agg_type]
+                                            if isinstance(agg_type_def, dict) and 'field' in agg_type_def:
+                                                field_name = agg_type_def['field']
+                                                if field_name in invalid_fields:
+                                                    logger.warning(f"AGGRESSIVELY REMOVING invalid field '{field_name}' from aggregation '{agg_name}.{agg_type}.field' (not in {index_id})")
+                                                    # Remove the entire aggregation if field is invalid
+                                                    keys_to_remove.append(agg_name)
+                                                    count += 1
+                                                    break
+                                                elif field_name in correct_field_map:
+                                                    correct_field = correct_field_map[field_name]
+                                                    logger.warning(f"REPLACING '{field_name}' with '{correct_field}' in aggregation '{agg_name}.{agg_type}.field'")
+                                                    agg_type_def['field'] = correct_field
+                                                    count += 1
+                                    
+                                    # Recursively check nested aggregations
+                                    count += remove_invalid_fields_recursive(agg_def, f"{current_path}.{agg_name}")
+                    
+                    # Check _source
+                    elif key == '_source':
+                        if isinstance(value, list):
+                            original_len = len(value)
+                            value[:] = [f for f in value if f not in invalid_fields]
+                            if len(value) < original_len:
+                                count += (original_len - len(value))
+                    
+                    # Check sort
+                    elif key == 'sort':
+                        if isinstance(value, list):
+                            for sort_item in value:
+                                if isinstance(sort_item, dict):
+                                    for sort_field in list(sort_item.keys()):
+                                        if sort_field in invalid_fields:
+                                            logger.warning(f"AGGRESSIVELY REMOVING invalid sort field '{sort_field}' (not in {index_id})")
+                                            sort_item.pop(sort_field, None)
+                                            count += 1
+                    
+                    # Recursively check nested structures
+                    else:
+                        count += remove_invalid_fields_recursive(value, current_path)
+                
+                # Remove empty clauses
+                for key_to_remove in keys_to_remove:
+                    obj.pop(key_to_remove, None)
+            
+            elif isinstance(obj, list):
+                for item in obj:
+                    count += remove_invalid_fields_recursive(item, path)
+            
+            return count
+        
+        # Remove invalid fields from the entire query payload
+        # Start from the query object to catch nested structures in bool.filter, etc.
+        query_obj = query_payload.get('query', {})
+        if query_obj:
+            removed_count = remove_invalid_fields_recursive(query_obj, "query")
+        else:
+            removed_count = remove_invalid_fields_recursive(query_payload)
+        
+        # Also clean _source and sort at root level
+        if '_source' in query_payload:
+            removed_count += remove_invalid_fields_recursive({'_source': query_payload['_source']}, "")
+        if 'sort' in query_payload:
+            removed_count += remove_invalid_fields_recursive({'sort': query_payload['sort']}, "")
+        
+        # Clean up empty filter arrays
+        if query_obj and 'bool' in query_obj:
+            bool_query = query_obj['bool']
+            for clause_type in ['filter', 'must', 'should', 'must_not']:
+                if clause_type in bool_query and isinstance(bool_query[clause_type], list):
+                    # Remove empty dicts from filter arrays
+                    bool_query[clause_type] = [item for item in bool_query[clause_type] 
+                                             if not (isinstance(item, dict) and not item)]
+        
+        if removed_count > 0:
+            logger.warning(f"AGGRESSIVELY removed {removed_count} known invalid field(s) from query for index {index_id}")
     
     def _remove_terms_lookup_recursive(self, obj: Any, parent_key: str = None) -> None:
         """Aggressively remove ALL terms_lookup structures from anywhere in the object."""
@@ -4113,36 +5120,71 @@ class QueryOrchestrator:
             
             bool_query[clause_type] = filtered_clauses
 
-    def _ensure_module_status_default(self, bool_query: Dict[str, Any], user_message: str):
+    def _ensure_module_status_default(self, bool_query: Dict[str, Any], user_message: str, index_id: str = None):
         """
-        Ensure module queries default to module_status = 0 unless explicitly overridden.
+        Ensure module queries default to module_status = 0 (or status = 0 for catalog) unless explicitly overridden.
         
-        CRITICAL: For ANY query about assigned modules, module_status = 0 MUST always be included.
-        This ensures we only count published/live modules, not drafts or deleted ones.
+        CRITICAL: Only applies to consumption index. For catalog index, uses 'status' field.
+        Does NOT apply to user profile index (no module fields).
         """
+        # CRITICAL: Only enforce for consumption index - catalog index uses 'status', user profile has no modules
+        if not index_id:
+            # Try to get from query_payload if available
+            return
+        
+        # Map index_id to check if it's consumption index
+        is_consumption_index = False
+        is_catalog_index = False
+        
+        if index_id in settings.OPENSEARCH_INDEXES:
+            if index_id == 'module_consumption_data':
+                is_consumption_index = True
+            elif index_id == 'module_catalog_data':
+                is_catalog_index = True
+            elif index_id in ('user_profile_data', 'monthly_user_activity_data'):
+                # User profile / monthly activity indices have no module fields - do nothing
+                return
+        else:
+            # Check if it's the actual index name
+            if 'consumption' in str(index_id).lower():
+                is_consumption_index = True
+            elif 'summary_reports' in str(index_id).lower() and 'consumption' not in str(index_id).lower():
+                is_catalog_index = True
+            elif 'monthly_user_activity' in str(index_id).lower():
+                return
+        
+        # CRITICAL: For catalog index, DO NOT add module_status - it doesn't exist!
+        # Only enforce for consumption index
+        if not is_consumption_index:
+            if is_catalog_index:
+                logger.info(f"Skipping module_status enforcement for catalog index {index_id} - uses 'status' field instead")
+            return
+        
         if not user_message:
             return
         message_lower = user_message.lower()
         
-        # CRITICAL: Check for assigned modules queries - these MUST always have module_status = 0
+        # CRITICAL: Check for assigned modules queries - these MUST always have module_status = 0 (consumption only)
         assigned_keywords = ['assigned', 'assignment', 'assignments', 'enrolled', 'delivered']
         has_assigned_keyword = any(keyword in message_lower for keyword in assigned_keywords)
         
         # Check if this is about modules (either explicit module keywords OR assigned keywords)
         has_module_keyword = any(keyword in message_lower for keyword in self.MODULE_KEYWORDS)
         
-        # If query mentions assigned modules or assignments, ALWAYS enforce module_status = 0
+        # If query mentions assigned modules or assignments, ALWAYS enforce module_status = 0 (consumption index only)
         if has_assigned_keyword or has_module_keyword:
             # Skip if user explicitly asked for non-published modules
             if any(keyword in message_lower for keyword in self.MODULE_NON_PUBLISHED_KEYWORDS):
                 return
+            
             # Skip if module_status filter already exists
-            if self._has_module_status_filter(bool_query):
+            if self._has_field_filter(bool_query, 'module_status'):
                 return
-            # Add module_status = 0 filter
+            
+            # Add module_status = 0 filter (ONLY for consumption index)
             self._append_filter_clause(bool_query, {"term": {"module_status": 0}})
             if has_assigned_keyword:
-                logger.info("Enforced module_status = 0 for assigned modules query")
+                logger.info(f"Enforced module_status = 0 for assigned modules query (index: {index_id})")
 
     def _has_module_status_filter(self, bool_query: Dict[str, Any]) -> bool:
         return self._has_field_filter(bool_query, 'module_status')
@@ -4653,7 +5695,13 @@ class QueryOrchestrator:
         return None
     
     def _execute_query(self, index_id: str, query: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute query against OpenSearch."""
+        """
+        Execute query against OpenSearch.
+        
+        Args:
+            index_id: Single index_id string OR comma-separated string OR list of index_ids for multi-index queries
+            query: OpenSearch query dictionary
+        """
         if not query:
             return {'success': False, 'error': 'Empty query'}
         
@@ -4731,23 +5779,49 @@ class QueryOrchestrator:
                 if isinstance(agg_def, dict):
                     ensure_module_count_final(agg_def)
         
-        # Ensure index exists and is properly mapped
-        if index_id not in settings.OPENSEARCH_INDEXES:
-            # Try to find it - maybe they passed the actual index name
-            for key in settings.OPENSEARCH_INDEXES.keys():
-                if key == index_id or settings.OPENSEARCH_INDEXES[key] == index_id:
-                    index_id = key
-                    logger.info(f"Mapped index '{index_id}' to key '{key}'")
-                    break
+        # Handle multiple indices - support string (single or comma-separated) or list
+        if isinstance(index_id, list):
+            index_ids = index_id
+        elif isinstance(index_id, str) and ',' in index_id:
+            index_ids = [idx.strip() for idx in index_id.split(',')]
+        else:
+            index_ids = [index_id]
         
-        # Verify the index_id is in our configuration
-        if index_id not in settings.OPENSEARCH_INDEXES:
-            available = list(settings.OPENSEARCH_INDEXES.keys())
-            error_msg = f"Index '{index_id}' not found in configuration. Available indexes: {available}"
-            logger.error(error_msg)
-            return {'success': False, 'error': error_msg}
+        # Validate all indices exist and map them
+        # Accept both index IDs (keys) and actual index names (values)
+        validated_index_ids = []
+        for idx_id in index_ids:
+            # First check if it's an index ID (key)
+            if idx_id in settings.OPENSEARCH_INDEXES:
+                validated_index_ids.append(idx_id)
+            else:
+                # Check if it's an actual index name (value)
+                found = False
+                for key, value in settings.OPENSEARCH_INDEXES.items():
+                    if value == idx_id:
+                        # They passed the actual index name, use the key
+                        validated_index_ids.append(key)
+                        logger.info(f"Mapped actual index name '{idx_id}' to index ID '{key}'")
+                        found = True
+                        break
         
-        result = self.os_client.execute_query(index_id, query)
+                if not found:
+                    available_ids = list(settings.OPENSEARCH_INDEXES.keys())
+                    available_names = list(settings.OPENSEARCH_INDEXES.values())
+                    error_msg = (
+                        f"Index '{idx_id}' not found in configuration. "
+                        f"Available index IDs: {available_ids}. "
+                        f"Available index names: {available_names}"
+                    )
+                    logger.error(error_msg)
+                    return {'success': False, 'error': error_msg}
+        
+        # Pass single index_id or comma-separated string to execute_query
+        # execute_query will handle the conversion to actual index names
+        index_param = ','.join(validated_index_ids) if len(validated_index_ids) > 1 else validated_index_ids[0]
+        logger.info(f"Executing query on {len(validated_index_ids)} index(es): {index_param}")
+        
+        result = self.os_client.execute_query(index_param, query)
         
         if result.get('success'):
             if 'results' in result:

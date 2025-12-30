@@ -1852,7 +1852,19 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
   }
 
   getQueryJson(msg: DisplayMessage): string {
-    return JSON.stringify(msg.response?.query ?? {}, null, 2);
+    const query = msg.response?.query ?? {};
+    const indexId = msg.response?.index_id;
+    
+    // If index_id is available, include it in the display
+    if (indexId) {
+      const queryWithIndex = {
+        index_id: indexId,
+        query: query
+      };
+      return JSON.stringify(queryWithIndex, null, 2);
+    }
+    
+    return JSON.stringify(query, null, 2);
   }
 
   getAggregations(aggregations: Record<string, any> | undefined): { name: string; value: string | number; items?: string[]; description?: string }[] {
