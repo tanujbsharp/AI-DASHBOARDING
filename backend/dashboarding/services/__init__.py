@@ -10,6 +10,7 @@ from .conversation_context import (
     get_context_manager
 )
 from .query_orchestrator import QueryOrchestrator, get_orchestrator, reload_orchestrator
+from .report_planner import ReportPlanner
 
 __all__ = [
     'OpenSearchClient',
@@ -26,4 +27,5 @@ __all__ = [
     'QueryOrchestrator',
     'get_orchestrator',
     'reload_orchestrator',
+    'ReportPlanner',
 ]

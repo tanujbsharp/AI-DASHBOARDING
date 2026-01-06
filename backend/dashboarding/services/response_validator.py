@@ -33,6 +33,25 @@ class ResponseValidator:
     - Made-up statistics
     """
     
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        """Convert value to int when possible without raising exceptions."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return int(float(stripped))
+            except ValueError:
+                return None
+        return None
+    
     @classmethod
     def validate_response(
         cls,
@@ -182,11 +201,11 @@ class ResponseValidator:
         valid = set()
         
         # Add total
-        total = query_results.get('total', 0)
+        total = cls._safe_int(query_results.get('total', 0)) or 0
         valid.add(total)
         
         # Add count of returned results
-        count = query_results.get('count', 0)
+        count = cls._safe_int(query_results.get('count', 0)) or 0
         valid.add(count)
         
         # Process aggregations
@@ -210,11 +229,15 @@ class ResponseValidator:
             if isinstance(agg_value, dict):
                 # Cardinality/value
                 if 'value' in agg_value:
-                    valid.add(int(agg_value['value']))
+                    numeric_value = cls._safe_int(agg_value.get('value'))
+                    if numeric_value is not None:
+                        valid.add(numeric_value)
                 
                 # Doc count
                 if 'doc_count' in agg_value:
-                    valid.add(int(agg_value['doc_count']))
+                    doc_value = cls._safe_int(agg_value.get('doc_count'))
+                    if doc_value is not None:
+                        valid.add(doc_value)
                 
                 # Buckets
                 if 'buckets' in agg_value:
@@ -229,22 +252,25 @@ class ResponseValidator:
                     else:
                         bucket_list = []
                     
-                    valid.add(len(bucket_list))  # Number of buckets
+                    valid.add(len(bucket_list))  # Number of buckets (already int)
                     for bucket in bucket_list:
                         # Skip if bucket is not a dict (shouldn't happen, but be safe)
                         if not isinstance(bucket, dict):
                             continue
                         if 'doc_count' in bucket:
-                            valid.add(int(bucket['doc_count']))
+                            bucket_doc = cls._safe_int(bucket.get('doc_count'))
+                            if bucket_doc is not None:
+                                valid.add(bucket_doc)
                         # Nested aggregations in bucket
                         for key, val in bucket.items():
                             if isinstance(val, dict):
                                 # Extract value (for metrics like completion_rate, assigned, etc.)
                                 if 'value' in val:
-                                    value = val['value']
+                                    value = val.get('value')
                                     # Handle both int and float values (completion rates are floats)
-                                    if isinstance(value, (int, float)):
-                                        valid.add(int(value))
+                                    numeric = cls._safe_int(value)
+                                    if numeric is not None:
+                                        valid.add(numeric)
                                         # For percentages/rates, also add rounded versions
                                         if isinstance(value, float) and 0 <= value <= 100:
                                             valid.add(int(round(value)))
@@ -258,10 +284,9 @@ class ResponseValidator:
                 # Stats
                 for stat in ['min', 'max', 'avg', 'sum', 'count']:
                     if stat in agg_value and agg_value[stat] is not None:
-                        try:
-                            valid.add(int(agg_value[stat]))
-                        except (ValueError, TypeError):
-                            pass
+                        numeric_stat = cls._safe_int(agg_value.get(stat))
+                        if numeric_stat is not None:
+                            valid.add(numeric_stat)
                 
                 # Recurse into nested aggregations
                 nested = {k: v for k, v in agg_value.items() 
@@ -270,17 +295,19 @@ class ResponseValidator:
                     cls._extract_numbers_from_aggregations(nested, valid, total)
             
             elif isinstance(agg_value, (int, float)):
-                valid.add(int(agg_value))
+                numeric_value = cls._safe_int(agg_value)
+                if numeric_value is not None:
+                    valid.add(numeric_value)
     
     @classmethod
     def _add_calculated_values(cls, valid: set, total: int, aggregations: Dict[str, Any]):
         """Add commonly calculated values (percentages, rates) to valid set."""
-        if total == 0:
+        if total is None or total == 0:
             return
         
         # For each numeric value, calculate what percentage of total it represents
         for num in list(valid):
-            if num > 0 and num <= total:
+            if isinstance(num, (int, float)) and num > 0 and num <= total:
                 # Calculate percentage
                 pct = round((num / total) * 100, 1)
                 valid.add(int(pct))
@@ -292,9 +319,9 @@ class ResponseValidator:
             if 'completed' in agg_name.lower() or 'complete' in agg_name.lower():
                 if isinstance(agg_value, dict):
                     if 'value' in agg_value:
-                        completed_count = int(agg_value['value'])
+                        completed_count = cls._safe_int(agg_value.get('value'))
                     elif 'doc_count' in agg_value:
-                        completed_count = int(agg_value['doc_count'])
+                        completed_count = cls._safe_int(agg_value.get('doc_count'))
         
         if completed_count is not None and total > 0:
             rate = round((completed_count / total) * 100, 1)
@@ -345,7 +372,7 @@ class ResponseValidator:
             return issues
         
         # Get total and relevant counts
-        total = query_results.get('total', 0)
+        total = cls._safe_int(query_results.get('total', 0)) or 0
         if total == 0:
             return issues
         
@@ -358,14 +385,14 @@ class ResponseValidator:
             if isinstance(agg_value, dict):
                 count = None
                 if 'value' in agg_value:
-                    count = int(agg_value['value'])
+                    count = cls._safe_int(agg_value.get('value'))
                 elif 'doc_count' in agg_value:
-                    count = int(agg_value['doc_count'])
+                    count = cls._safe_int(agg_value.get('doc_count'))
                     # Also check nested
                     for k, v in agg_value.items():
                         if isinstance(v, dict) and 'value' in v:
-                            nested_count = int(v['value'])
-                            if nested_count <= total:
+                            nested_count = cls._safe_int(v.get('value'))
+                            if nested_count is not None and nested_count <= total:
                                 pct = round((nested_count / total) * 100, 1)
                                 valid_percentages.add(pct)
                                 valid_percentages.add(round(pct))
@@ -464,12 +491,15 @@ class ResponseValidator:
                         # Detect if this is a user query (key is email or agg_name contains 'user')
                         is_user_query = '@' in str(key) or 'user' in agg_name.lower() or 'by_user' in agg_name.lower()
                         
+                        # Ensure count is an integer (fallback to 0 if None)
+                        count_int = cls._safe_int(count) or 0
+                        
                         if is_user_query and 'unique_modules' in str(top_bucket):
-                            return f"{key} has completed the most modules with {int(count):,} unique modules completed."
+                            return f"{key} has completed the most modules with {count_int:,} unique modules completed."
                         elif is_user_query:
-                            return f"{key} has the highest count with {int(count):,}."
+                            return f"{key} has the highest count with {count_int:,}."
                         else:
-                            return f"Top result: {key} with {int(count):,}."
+                            return f"Top result: {key} with {count_int:,}."
         
         parts = [f"Found {total:,} records"]
         
@@ -480,7 +510,7 @@ class ResponseValidator:
         for agg_name, agg_value in aggregations.items():
             if isinstance(agg_value, dict):
                 if 'value' in agg_value:
-                    value = int(agg_value['value'])
+                    value = cls._safe_int(agg_value.get('value')) or 0
                     label = agg_value.get('_label', cls._format_label(agg_name))
                     parts.append(f"{label}: {value:,}")
                 elif 'buckets' in agg_value:
@@ -488,7 +518,7 @@ class ResponseValidator:
                     label = agg_value.get('_label', cls._format_label(agg_name))
                     parts.append(f"{label}: {bucket_count} categories")
                 elif 'doc_count' in agg_value:
-                    count = int(agg_value['doc_count'])
+                    count = cls._safe_int(agg_value.get('doc_count')) or 0
                     label = agg_value.get('_label', cls._format_label(agg_name))
                     parts.append(f"{label}: {count:,}")
         

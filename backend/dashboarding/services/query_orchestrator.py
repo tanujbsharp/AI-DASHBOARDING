@@ -113,6 +113,68 @@ class QueryOrchestrator:
         'trainer_email_addr'
     ]
     
+    ACTIVITY_METRIC_SYNONYMS = {
+        'module': ['module', 'modules', 'module completion', 'module completions'],
+        'instant_answers': [
+            'instant answer', 'instant answers', 'instant ask', 'instant asked',
+            'ia', 'ia usage', 'questions asked', 'question asked', 'question count',
+            'questions count', 'queries', 'query', 'queries asked'
+        ],
+        'learning_pathway': ['learning pathway', 'learning pathways', 'pathway', 'pathways'],
+        'lotd': ['lotd', 'learning of the day', 'learning of day'],
+        'points': ['points', 'points earned', 'earned points', 'score points'],
+        'total_points': ['total points']
+    }
+    ALL_ACTIVITY_METRICS = ['module', 'instant_answers', 'learning_pathway', 'lotd', 'points', 'total_points']
+
+    @staticmethod
+    def _tokenize_for_metric_detection(text: str) -> List[str]:
+        """Split text into lowercase tokens for fuzzy keyword detection."""
+        import re
+        return [token for token in re.split(r'[^a-z0-9]+', text.lower()) if token]
+
+    @staticmethod
+    def _word_matches_tokens(word: str, tokens: List[str], threshold: float = 0.82) -> bool:
+        """Return True if word exactly or fuzzily matches any token."""
+        if not word or not tokens:
+            return False
+        normalized_word = word.lower()
+        if normalized_word in tokens:
+            return True
+        import difflib
+        for token in tokens:
+            if abs(len(token) - len(normalized_word)) > 2:
+                continue
+            if difflib.SequenceMatcher(None, normalized_word, token).ratio() >= threshold:
+                return True
+        return False
+
+    def _keyword_matches_message(self, keyword: str, message: str, tokens: List[str]) -> bool:
+        """Check if keyword (single or multi-word) is present in the message using fuzzy matching."""
+        if not keyword:
+            return False
+        normalized_keyword = keyword.lower().strip()
+        if normalized_keyword in message:
+            return True
+        parts = [part for part in normalized_keyword.split() if part]
+        if not parts:
+            return False
+        return all(self._word_matches_tokens(part, tokens) for part in parts)
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        """Safely convert a value to int, returning None if conversion is not possible."""
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(float(value))
+            except ValueError:
+                return None
+        return None
+    
     def __init__(self):
         self.os_client = OpenSearchClient()
         self.use_conversation_context = getattr(settings, 'USE_CONVERSATION_CONTEXT', False)
@@ -151,6 +213,7 @@ class QueryOrchestrator:
         """
         query_payload = None  # Initialize to capture query in case of errors
         try:
+            activity_metrics_requested = self._detect_activity_metrics(user_message)
             # Step 1: Get/create conversation context (optional)
             if self.use_conversation_context:
                 context = self.context_manager.get_or_create(session_id)
@@ -228,11 +291,125 @@ class QueryOrchestrator:
                 selected_index_id = first_index
                 logger.warning(f"Using single index: {selected_index_id}")
             
-            # Adjust default time field based on index needs (e.g., monthly activity → completed_on)
+            module_catalog_kpi = False
+            
+            # Force monthly activity index for month-level metric queries (unless it's a specific user ask)
+            if self._should_force_monthly_activity_index(
+                user_message=user_message,
+                activity_metrics=activity_metrics_requested,
+                time_period=effective_time_period
+            ):
+                if selected_index_id == 'daily_user_activity_data':
+                    selected_index_id = 'monthly_user_activity_data'
+                    query_payload['index_id'] = selected_index_id
+                    logger.info("Routing activity metric query to monthly_user_activity_data based on timeframe")
+            
+            # Check if this is a user activity info request (e.g., "completion info for X in October")
+            # Route to daily_user_activity_data and build summary table UNLESS user asks for module details
+            user_activity_summary_mode = False
+            if self._is_user_activity_info_request(user_message, effective_time_period):
+                identifier = self._extract_user_identifier_from_message(user_message)
+                if identifier:
+                    selected_index_id = 'daily_user_activity_data'
+                    query_payload['index_id'] = selected_index_id
+                    self._force_user_activity_summary_query(
+                        query_payload,
+                        identifier,
+                        effective_time_period
+                    )
+                    query_payload['response_type'] = ResponseType.TABLE.value
+                    query_payload['fields_to_show'] = ['metric', 'count']
+                    user_activity_summary_mode = True
+                    logger.info(f"Forced user activity summary query for user: {identifier}")
+            
+            if selected_index_id == 'module_catalog_data' and self._is_module_catalog_count_request(user_message):
+                self._force_module_catalog_count_query(query_payload)
+                query_payload['response_type'] = ResponseType.KPI_WIDGET.value
+                metadata = query_payload.setdefault('metadata', {})
+                metadata['module_catalog_kpi'] = True
+                module_catalog_kpi = True
+                logger.info("Forced module catalog KPI query (value_count on mid)")
+            
+            # Adjust default time field based on index needs (e.g., monthly/daily activity → completed_on)
             time_field_override = self._resolve_time_field_for_index(time_field_override, selected_index_id, user_message)
             
             rating_query = self._is_rating_query(user_message, query_payload)
             sanitize_time_field = 'completed_date' if rating_query else time_field_override
+            
+            # Enforce KPI aggregations for activity metric queries on daily/monthly indexes
+            self._ensure_activity_metric_aggregation(
+                query_payload,
+                activity_metrics_requested,
+                selected_index_id,
+                user_message=user_message,
+                response_type=response_type
+            )
+            self._deduplicate_aggregations(query_payload)
+            
+            # CRITICAL: Force KPI_WIDGET response type for simple activity metric count queries
+            # "how many instant answers" / "how many learning pathways" should be KPI, not chart
+            if activity_metrics_requested and selected_index_id in ('daily_user_activity_data', 'monthly_user_activity_data'):
+                # Check if this is a simple count query (not asking for breakdown/chart)
+                message_lower = user_message.lower()
+                is_simple_count = (
+                    ('how many' in message_lower or 'total' in message_lower or 'count' in message_lower) and
+                    not any(word in message_lower for word in ['graph', 'chart', 'by city', 'by designation', 'breakdown', 'trend', 'over time', 'per day', 'daily'])
+                )
+                if is_simple_count:
+                    query_payload['response_type'] = ResponseType.KPI_WIDGET.value
+                    logger.info(f"Forced KPI_WIDGET response type for activity metric count query")
+            
+            # CRITICAL: Force TABLE for "which modules/users" listing queries BEFORE query execution
+            # User asking "which modules completed" wants a TABLE (list of modules), not a chart
+            # This must happen BEFORE query execution so we can modify the query structure
+            message_lower = user_message.lower()
+            listing_keywords = ['which module', 'which modules', 'which user', 'which users', 
+                               'which people', 'which training', 'which trainings',
+                               'which all module', 'which all modules',
+                               'which all user', 'which all users']
+            is_listing_query = (
+                any(kw in message_lower for kw in listing_keywords) and
+                not any(word in message_lower for word in ['graph', 'chart', 'visuali', 'bar', 'pie', 'line'])
+            )
+            
+            current_response_type = query_payload.get('response_type', response_type.value)
+            if isinstance(current_response_type, ResponseType):
+                current_response_type = current_response_type.value
+            
+            if is_listing_query:
+                if current_response_type in ['bar_chart', 'pie_chart', 'line_chart']:
+                    logger.info(f"Forcing TABLE for 'which modules/users' listing query (was {current_response_type})")
+                    query_payload['response_type'] = ResponseType.TABLE.value
+                else:
+                    logger.info(f"Detected listing query - ensuring table structure (current response type: {current_response_type})")
+                
+                # Convert aggregation query to document query for table display
+                query_body = query_payload.get('query', {})
+                if isinstance(query_body, dict):
+                    # If query has size: 0 (aggregation-only), set size to return actual documents
+                    if query_body.get('size', 0) == 0:
+                        query_body['size'] = 100
+                        logger.info("Changed query size from 0 to 100 for table display")
+                    
+                    # Remove aggregations - tables should return documents
+                    if 'aggs' in query_body:
+                        query_body.pop('aggs', None)
+                        logger.info("Removed aggregations to force document response for listing query")
+                    
+                    # Ensure _source includes relevant fields for the listing
+                    if '_source' not in query_body or not query_body.get('_source'):
+                        # Determine fields based on whether asking about modules or users
+                        if 'module' in message_lower:
+                            query_body['_source'] = ['module_name', 'mid', 'first_name', 'last_name', 
+                                                    'email_addr', 'completed_date', 'completed_status']
+                        else:
+                            query_body['_source'] = ['first_name', 'last_name', 'email_addr', 
+                                                    'module_name', 'completed_date', 'completed_status']
+                        logger.info(f"Added _source fields for table: {query_body['_source']}")
+                    
+                    # If listing activity metrics users (daily/monthly index), ensure metric filters remain
+                    if selected_index_id in ('daily_user_activity_data', 'monthly_user_activity_data') and activity_metrics_requested:
+                        self._ensure_activity_metric_filters(query_body, activity_metrics_requested)
             
             # Clean up unsupported constructs FIRST, before any other processing
             # This prevents errors from propagating through the pipeline
@@ -356,7 +533,15 @@ class QueryOrchestrator:
                     "Detected single-entity completion rate KPI query "
                     f"(module={is_module_completion_rate_kpi}, user={is_user_completion_rate_kpi})"
                 )
-                    # FORCE exact query structure for module completion rate
+                # CRITICAL: Completion rate KPIs MUST run on module_consumption_data
+                # Otherwise schema re-validation (post structured filters) will strip module_status and other required fields.
+                query_payload['index_id'] = index_id  # module_consumption_data
+                selected_index_id = index_id
+                # Ensure UI treats this as a KPI widget
+                query_payload['response_type'] = ResponseType.KPI_WIDGET.value
+                response_type = ResponseType.KPI_WIDGET
+
+                # FORCE exact query structure for module completion rate (defensive)
                 if is_module_completion_rate_kpi:
                         self._force_module_completion_rate_query_structure(query_payload, user_message)
             
@@ -372,6 +557,12 @@ class QueryOrchestrator:
                     if isinstance(query, dict):
                         bool_query = query.get('bool', {})
                         if isinstance(bool_query, dict):
+                            # CRITICAL: Completion rate denominators are "assigned modules" and must exclude non-published modules.
+                            # Always enforce module_status = 0 for completion rate KPIs on module_consumption_data.
+                            if selected_index_id == 'module_consumption_data' and not self._has_field_filter(bool_query, 'module_status'):
+                                self._append_filter_clause(bool_query, {"term": {"module_status": 0}})
+                                logger.info("Enforced module_status = 0 for completion rate KPI query")
+
                             # Remove from filter list
                             filter_list = bool_query.get('filter', [])
                             if isinstance(filter_list, list):
@@ -484,6 +675,7 @@ class QueryOrchestrator:
             # Enforce column order from fields_to_show if specified
             # This ensures the _source fields match the exact order the user specified in the report builder
             self._enforce_column_order(query_payload, user_message)
+            self._ensure_identifier_fields(query_payload)
             
             # Sanitize again after applying filters (in case filters added unsupported constructs)
             # Sanitize again after applying filters (in case filters added unsupported constructs).
@@ -499,6 +691,15 @@ class QueryOrchestrator:
                 if isinstance(query_body, dict):
                     self._remove_prohibited_filters_from_top_level(query_body)
                     logger.info("Final cleanup: Removed any prohibited filters from top-level for haven't completed query")
+            
+            # Final deduplication once all filters/rules have run to avoid duplicates
+            self._deduplicate_filters(query_payload)
+            self._deduplicate_aggregations(query_payload)
+
+            # Final safety net: never execute a query with a top-level pipeline aggregation (e.g., bucket_script)
+            # This prevents OpenSearch validation errors like:
+            #   "bucket_script aggregation [completion_rate] must be declared inside of another aggregation"
+            self._ensure_completion_rate_scope_wrapper(query_payload)
 
             # Step 5: Execute query against OpenSearch
             execution_result = self._execute_query(
@@ -512,6 +713,16 @@ class QueryOrchestrator:
                     f"Query execution failed: {execution_result.get('error', 'Unknown error')}",
                     query=query_payload.get('query', {})
                 )
+            
+            # CRITICAL: Apply context-aware aggregation labels based on user's question
+            # For "which modules completed" queries, the chart should show "Completions", not "Modules"
+            self._apply_context_aware_labels(execution_result, user_message, query_payload)
+            
+            # Convert user activity summary aggregations to table rows
+            if user_activity_summary_mode:
+                self._convert_activity_summary_results(execution_result)
+            if module_catalog_kpi:
+                execution_result.setdefault('metadata', {})['module_catalog_kpi'] = True
             
             # Extract results from "zero completions in range" aggregation queries
             if self._is_havent_completed_in_time_query(user_message, effective_time_period):
@@ -569,11 +780,52 @@ class QueryOrchestrator:
             
             # Step 9: Build final response
             # Use response_type from query_payload if available (module intent overrides detection)
+            # Another defensive deduplication so the UI always sees clean filters/aggs
+            self._deduplicate_filters(query_payload)
+            self._deduplicate_aggregations(query_payload)
+            
             final_response_type = query_payload.get('response_type', response_type.value)
             if isinstance(final_response_type, ResponseType):
                 final_response_type = final_response_type.value
             # Normalize common aliases or model-provided variants to our known ResponseType values
             final_response_type = self._normalize_response_type(final_response_type, fallback=response_type.value)
+            
+            # CRITICAL: Force KPI_WIDGET for simple activity metric count queries
+            # This override happens LAST to ensure it takes precedence
+            if activity_metrics_requested and selected_index_id in ('daily_user_activity_data', 'monthly_user_activity_data'):
+                message_lower = user_message.lower()
+                is_simple_count = (
+                    ('how many' in message_lower or 'total' in message_lower or 'count' in message_lower) and
+                    not any(word in message_lower for word in ['graph', 'chart', 'by city', 'by designation', 'breakdown', 'trend', 'over time', 'per day', 'daily', 'visuali'])
+                )
+                if is_simple_count:
+                    final_response_type = ResponseType.KPI_WIDGET.value
+                    logger.info(f"Final override: KPI_WIDGET for activity metric query")
+            
+            # CRITICAL: Force TABLE for "which modules/users" listing queries
+            # User asking "which modules completed" wants a TABLE, not a chart
+            message_lower = user_message.lower()
+            listing_keywords = ['which module', 'which modules', 'which user', 'which users', 
+                               'which people', 'which training', 'which trainings',
+                               'which all module', 'which all modules',
+                               'which all user', 'which all users']
+            is_listing_query = (
+                any(kw in message_lower for kw in listing_keywords) and
+                not any(word in message_lower for word in ['graph', 'chart', 'visuali', 'bar', 'pie', 'line'])
+            )
+            if is_listing_query:
+                if final_response_type in ['bar_chart', 'pie_chart', 'line_chart']:
+                    final_response_type = ResponseType.TABLE.value
+                # Ensure query returns documents, not just aggregations
+                query_body = query_payload.get('query', {})
+                if isinstance(query_body, dict):
+                    if query_body.get('size', 0) == 0:
+                        query_body['size'] = 100  # Return actual documents for table display
+                    if 'aggs' in query_body:
+                        query_body.pop('aggs', None)
+                    if selected_index_id in ('daily_user_activity_data', 'monthly_user_activity_data') and activity_metrics_requested:
+                        self._ensure_activity_metric_filters(query_body, activity_metrics_requested)
+                logger.info(f"Final override applied for listing query (response_type={final_response_type})")
             
             # Always include the query in response, even if results are empty (0 records)
             # This allows the UI to display the query for debugging/verification
@@ -622,60 +874,106 @@ class QueryOrchestrator:
             
             # CRITICAL: For completion rate queries, extract the value and replace scope aggregation
             # This prevents the UI from showing "[object Object]"
-            if 'scope' in aggregations:
-                scope_agg = aggregations['scope']
-                if isinstance(scope_agg, dict):
-                    buckets = scope_agg.get('buckets', {})
-                    # Handle both dict and list formats for buckets
-                    if isinstance(buckets, dict):
-                        all_bucket = buckets.get('all', {})
-                    elif isinstance(buckets, list) and len(buckets) > 0:
-                        # If buckets is a list, use the first bucket
-                        all_bucket = buckets[0]
-                    else:
-                        all_bucket = {}
-                    
-                    if isinstance(all_bucket, dict):
-                        completion_rate = all_bucket.get('completion_rate', {})
-                        
-                        # Check for user completion rate structure FIRST (assigned_modules/completed_modules)
-                        # This is the pattern used by _force_user_completion_rate_query_structure
-                        assigned_modules = all_bucket.get('assigned_modules', {})
-                        completed = all_bucket.get('completed', {})
-                        if isinstance(assigned_modules, dict) and 'value' in assigned_modules and isinstance(completed, dict):
-                            completed_modules = completed.get('completed_modules', {})
-                            if isinstance(completed_modules, dict) and 'value' in completed_modules:
-                                # This is a user completion rate query (uses cardinality on mid)
-                                # Extract rate_value from completion_rate if available, otherwise calculate it
-                                if isinstance(completion_rate, dict) and 'value' in completion_rate:
-                                    rate_value = completion_rate.get('value', 0)
-                                else:
-                                    # Calculate completion rate manually if bucket_script didn't provide it
-                                    assigned_count = assigned_modules.get('value', 0)
-                                    completed_count = completed_modules.get('value', 0)
-                                    rate_value = (completed_count / assigned_count * 100) if assigned_count > 0 else 0
-                                    logger.warning(f"User completion rate structure detected but completion_rate.value missing. Calculated manually: {rate_value:.1f}%")
-                                
-                                aggregations['scope'] = {
-                                    '_label': 'Completion Rate',
-                                    'value': rate_value,
-                                    'formatted_value': f"{rate_value:.1f}%"
-                                }
-                                logger.info(f"Extracted user completion rate {rate_value:.1f}% from scope aggregation for UI display (assigned: {assigned_modules.get('value')}, completed: {completed_modules.get('value')})")
-                        # Check for module completion rate structure (assigned/completed_count)
-                        # This is the pattern used by _force_module_completion_rate_query_structure
-                        elif isinstance(completion_rate, dict) and 'value' in completion_rate:
+            def _simplify_completion_rate_scope(scope_key: str) -> bool:
+                scope_agg = aggregations.get(scope_key)
+                if not isinstance(scope_agg, dict):
+                    return False
+
+                buckets = scope_agg.get('buckets', {})
+                # Handle both dict and list formats for buckets
+                if isinstance(buckets, dict):
+                    all_bucket = buckets.get('all', {}) or (list(buckets.values())[0] if buckets else {})
+                elif isinstance(buckets, list) and len(buckets) > 0:
+                    all_bucket = buckets[0]
+                else:
+                    all_bucket = {}
+                
+                if not isinstance(all_bucket, dict):
+                    return False
+
+                completion_rate = all_bucket.get('completion_rate', {})
+                
+                # Check for user completion rate structure FIRST (assigned_modules/completed_modules)
+                assigned_modules = all_bucket.get('assigned_modules', {})
+                completed = all_bucket.get('completed', {})
+                if isinstance(assigned_modules, dict) and 'value' in assigned_modules and isinstance(completed, dict):
+                    completed_modules = completed.get('completed_modules', {})
+                    if isinstance(completed_modules, dict) and 'value' in completed_modules:
+                        # Extract rate_value from completion_rate if available, otherwise calculate it
+                        if isinstance(completion_rate, dict) and 'value' in completion_rate:
                             rate_value = completion_rate.get('value', 0)
-                            # Replace scope aggregation with just the completion rate value
-                            aggregations['scope'] = {
-                                '_label': 'Completion Rate',
-                                'value': rate_value,
-                                'formatted_value': f"{rate_value:.1f}%"
-                            }
-                            logger.info(f"Extracted completion rate {rate_value:.1f}% from scope aggregation for UI display")
                         else:
-                            # Log warning if we have scope but can't extract completion rate
-                            logger.warning(f"Scope aggregation found but couldn't extract completion rate. all_bucket keys: {list(all_bucket.keys())}, completion_rate: {completion_rate}")
+                            assigned_count = assigned_modules.get('value', 0)
+                            completed_count = completed_modules.get('value', 0)
+                            rate_value = (completed_count / assigned_count * 100) if assigned_count > 0 else 0
+                            logger.warning(
+                                f"User completion rate structure detected but completion_rate.value missing. Calculated manually: {rate_value:.1f}%"
+                            )
+                        
+                        aggregations[scope_key] = {
+                            '_label': 'Completion Rate',
+                            'value': rate_value,
+                            'formatted_value': f"{rate_value:.1f}%"
+                        }
+                        logger.info(
+                            f"Extracted user completion rate {rate_value:.1f}% from {scope_key} aggregation for UI display "
+                            f"(assigned: {assigned_modules.get('value')}, completed: {completed_modules.get('value')})"
+                        )
+                        return True
+
+                # Module completion rate structure (assigned/completed/completion_rate)
+                # First try to get the bucket_script result
+                if isinstance(completion_rate, dict) and 'value' in completion_rate:
+                    rate_value = completion_rate.get('value', 0)
+                    aggregations[scope_key] = {
+                        '_label': 'Completion Rate',
+                        'value': rate_value,
+                        'formatted_value': f"{rate_value:.1f}%"
+                    }
+                    logger.info(f"Extracted completion rate {rate_value:.1f}% from {scope_key} bucket_script for UI display")
+                    return True
+                
+                # Fallback: If bucket_script didn't return value, calculate from assigned/completed counts
+                assigned_agg = all_bucket.get('assigned', {})
+                completed_agg = all_bucket.get('completed', {})
+                if isinstance(assigned_agg, dict) and isinstance(completed_agg, dict):
+                    assigned_count = assigned_agg.get('value', 0)
+                    # completed is a filter agg, so completed_count is nested inside
+                    completed_count_agg = completed_agg.get('completed_count', {})
+                    if isinstance(completed_count_agg, dict):
+                        completed_count = completed_count_agg.get('value', 0)
+                    else:
+                        # Fallback to doc_count if completed_count not found
+                        completed_count = completed_agg.get('doc_count', 0)
+                    
+                    if assigned_count > 0:
+                        rate_value = (completed_count / assigned_count) * 100
+                        aggregations[scope_key] = {
+                            '_label': 'Completion Rate',
+                            'value': rate_value,
+                            'formatted_value': f"{rate_value:.1f}%"
+                        }
+                        logger.info(
+                            f"Calculated module completion rate {rate_value:.1f}% manually "
+                            f"(completed: {completed_count}, assigned: {assigned_count}) for {scope_key}"
+                        )
+                        return True
+
+                logger.warning(
+                    f"{scope_key} aggregation found but couldn't extract completion rate. "
+                    f"all_bucket keys: {list(all_bucket.keys())}, completion_rate: {completion_rate}"
+                )
+                return False
+
+            # Prefer 'scope' (new pattern). Also support 'completion_scope' wrapper (old safety wrapper).
+            simplified = False
+            if 'scope' in aggregations:
+                simplified = _simplify_completion_rate_scope('scope')
+            elif 'completion_scope' in aggregations:
+                simplified = _simplify_completion_rate_scope('completion_scope')
+                if simplified:
+                    # Remove wrapper to avoid KPI widget showing buckets object noise
+                    aggregations.pop('completion_scope', None)
             
             if final_response_type in ['bar_chart', 'pie_chart', 'line_chart']:
                 if aggregations:
@@ -858,11 +1156,47 @@ class QueryOrchestrator:
         """
         Phase 2: Generate human-readable response using actual data.
         """
+        # Check if this is an activity metric query (learning pathway, instant answers, lotd, etc.)
+        # These should NOT be treated as completion rate queries
+        index_id = query_info.get('index_id', '')
+        is_activity_index = index_id in ('daily_user_activity_data', 'monthly_user_activity_data')
+        activity_metrics_in_query = self._detect_activity_metrics(original_query)
+        
         # CRITICAL: For completion rate queries, extract the value directly and return it
-        completion_rate_message = self._extract_completion_rate_message(query_results, original_query, time_period)
-        if completion_rate_message:
+        # BUT skip this for activity metric queries (learning pathway counts, instant answers, etc.)
+        if not is_activity_index and not activity_metrics_in_query:
+            completion_rate_message = self._extract_completion_rate_message(query_results, original_query, time_period)
+            if completion_rate_message:
+                return {
+                    'message': completion_rate_message,
+                    'highlights': [],
+                    'warnings': [],
+                    'metrics': self._extract_metrics(query_results),
+                    'title': query_info.get('title', 'Results')
+                }
+        
+        # For activity metric queries, generate a clear direct message
+        if is_activity_index or activity_metrics_in_query:
+            activity_message = self._generate_activity_metric_message(
+                query_results, original_query, time_period, activity_metrics_in_query
+            )
+            if activity_message:
+                return {
+                    'message': activity_message,
+                    'highlights': [],
+                    'warnings': [],
+                    'metrics': self._extract_metrics(query_results),
+                    'title': query_info.get('title', 'Results')
+                }
+        
+        metadata = query_info.get('metadata', {}) if isinstance(query_info, dict) else {}
+        if metadata.get('module_catalog_kpi'):
+            aggregations = query_results.get('aggregations', {})
+            total_count = self._extract_count_from_aggregation(aggregations.get('module_total', {})) or 0
+            time_context = f" in {time_period.description}" if time_period and not time_period.is_lifetime else ""
+            message = f"Found {total_count:,} modules{time_context}."
             return {
-                'message': completion_rate_message,
+                'message': message,
                 'highlights': [],
                 'warnings': [],
                 'metrics': self._extract_metrics(query_results),
@@ -1430,6 +1764,7 @@ class QueryOrchestrator:
         is_consumption_index = False
         is_user_profile_index = False
         is_monthly_activity_index = False
+        is_daily_activity_index = False
         
         if selected_index_id in settings.OPENSEARCH_INDEXES:
             if selected_index_id == 'module_consumption_data':
@@ -1438,6 +1773,8 @@ class QueryOrchestrator:
                 is_user_profile_index = True
             elif selected_index_id == 'monthly_user_activity_data':
                 is_monthly_activity_index = True
+            elif selected_index_id == 'daily_user_activity_data':
+                is_daily_activity_index = True
         else:
             # Check if it's the actual index name
             if 'consumption' in str(selected_index_id).lower():
@@ -1446,14 +1783,17 @@ class QueryOrchestrator:
                 is_user_profile_index = True
             elif 'monthly_user_activity' in str(selected_index_id).lower():
                 is_monthly_activity_index = True
+            elif 'daily_user_activity' in str(selected_index_id).lower():
+                is_daily_activity_index = True
         
         if is_consumption_index:
             self._append_filter_clause(bool_query, {"term": {"user_status": 5}})
             logger.info(f"Added user_status = 5 filter for consumption index")
-        elif is_user_profile_index or is_monthly_activity_index:
+        elif is_user_profile_index or is_monthly_activity_index or is_daily_activity_index:
             self._append_filter_clause(bool_query, {"term": {"status": 5}})
             logger.info(
-                f"Added status = 5 filter for {'monthly activity' if is_monthly_activity_index else 'user profile'} index"
+                f"Added status = 5 filter for "
+                f"{'monthly activity' if is_monthly_activity_index else ('daily activity' if is_daily_activity_index else 'user profile')} index"
             )
         else:
             logger.info(f"Skipping user status filter - not applicable for index: {selected_index_id}")
@@ -1888,6 +2228,14 @@ class QueryOrchestrator:
         # Actual index name (value)
         return 'monthly_user_activity' in str(index_id).lower()
 
+    def _is_daily_activity_index(self, index_id: Optional[str]) -> bool:
+        """True if the index refers to the daily per-user activity summary index."""
+        if not index_id:
+            return False
+        if index_id in settings.OPENSEARCH_INDEXES:
+            return index_id == 'daily_user_activity_data'
+        return 'daily_user_activity' in str(index_id).lower()
+
     def _resolve_time_field_for_index(
         self,
         requested_field: Optional[str],
@@ -1897,8 +2245,8 @@ class QueryOrchestrator:
         """
         Determine which time field should be used as the default/fallback based on the selected index.
         
-        For MONTHLY USER ACTIVITY index:
-        - Activity month questions → completed_on (epoch)
+        For MONTHLY/DAILY USER ACTIVITY indexes:
+        - Activity period questions → completed_on (epoch)
         - Operational freshness → updated_on / last_updated
         - Convert completion-oriented hints (completed_date) → completed_on
         """
@@ -1906,7 +2254,8 @@ class QueryOrchestrator:
         if not index_id:
             return field
         
-        if not self._is_monthly_activity_index(index_id):
+        is_activity_index = self._is_monthly_activity_index(index_id) or self._is_daily_activity_index(index_id)
+        if not is_activity_index:
             return field
         
         msg = (user_message or "").lower()
@@ -1932,6 +2281,486 @@ class QueryOrchestrator:
             return 'completed_on'
         
         return field
+    
+    def _ensure_identifier_fields(self, query_payload: Dict[str, Any]):
+        """
+        Ensure identifier columns (uid/email) are always present in _source/fields_to_show.
+        Prevents queries like "what is this user's UID" from dropping the UID column.
+        """
+        index_id = query_payload.get('index_id')
+        if index_id != 'user_profile_data':
+            return
+        
+        query_body = query_payload.get('query')
+        if not isinstance(query_body, dict):
+            return
+        
+        source_fields = query_body.setdefault('_source', [])
+        if not isinstance(source_fields, list):
+            source_fields = query_body['_source'] = []
+        
+        required_fields = ['uid', 'email_addr', 'first_name', 'last_name']
+        for field in required_fields:
+            if field not in source_fields:
+                source_fields.append(field)
+        
+        fields_to_show = query_payload.get('fields_to_show')
+        if fields_to_show is None:
+            query_payload['fields_to_show'] = required_fields.copy()
+        elif isinstance(fields_to_show, list):
+            for field in reversed(required_fields):
+                if field not in fields_to_show:
+                    fields_to_show.insert(0, field)
+        else:
+            query_payload['fields_to_show'] = required_fields.copy()
+    
+    def _should_force_monthly_activity_index(
+        self,
+        user_message: Optional[str],
+        activity_metrics: Set[str],
+        time_period: Optional[TimePeriod]
+    ) -> bool:
+        """Decide if activity metric query should use monthly aggregate index."""
+        if not activity_metrics or not time_period or time_period.is_lifetime:
+            return False
+        
+        if self._query_mentions_specific_user(user_message):
+            return False
+        
+        duration_seconds = max(0, time_period.end_timestamp - time_period.start_timestamp)
+        duration_days = duration_seconds / 86400 if duration_seconds else 0
+        
+        # Treat windows that span roughly a calendar month (or longer) as month-level questions
+        return duration_days >= 25
+    
+    def _query_mentions_specific_user(self, message: Optional[str]) -> bool:
+        """Heuristic check to see if the question targets a specific learner."""
+        if not message:
+            return False
+        
+        message_lower = message.lower()
+        if '@' in message_lower:
+            return True
+        
+        person_name = self._extract_person_name(message)
+        return bool(person_name)
+
+    def _extract_person_name(self, message: Optional[str]) -> Optional[str]:
+        """Best-effort heuristic to find a person name inside the user prompt."""
+        if not message:
+            return None
+        
+        import re
+        
+        stop_words = {
+            'how', 'many', 'users', 'user', 'modules', 'module', 'what', 'which',
+            'show', 'list', 'who', 'all', 'people', 'employees', 'learners',
+            'users?', 'them', 'they', 'completed', 'completion', 'completions',
+            'did', 'has', 'have', 'in', 'for', 'by', 'about', 'regarding',
+            'last', 'this', 'month', 'week', 'quarter'
+        }
+        
+        patterns = [
+            r'(?:for|about|regarding|by)\s+([A-Za-z][A-Za-z\'\-]*(?:\s+[A-Za-z][A-Za-z\'\-]*){0,2})',
+            r'(?:has|have|did)\s+([A-Za-z][A-Za-z\'\-]*(?:\s+[A-Za-z][A-Za-z\'\-]*){0,2})\s+(?:completed|finish|done|taken)',
+            r'([A-Za-z][A-Za-z\'\-]*(?:\s+[A-Za-z][A-Za-z\'\-]*){0,2})\'s\s+(?:completion|activity|modules?)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, message, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip()
+            cleaned = re.sub(r'[^A-Za-z\s\'\-]', '', candidate).strip()
+            cleaned_lower = cleaned.lower()
+            if cleaned_lower and cleaned_lower not in stop_words and 2 <= len(cleaned) <= 30:
+                return cleaned
+        
+        return None
+    
+    def _is_user_activity_info_request(
+        self,
+        message: Optional[str],
+        time_period: Optional[TimePeriod]
+    ) -> bool:
+        """
+        Detect if user is asking for a user's completion/activity info.
+        Returns True for requests like "completion info for X" or "what did X do".
+        Returns False if user specifically asks about module details/names/completion rate.
+        """
+        if not message:
+            return False
+        
+        # Must mention a specific user (email or name)
+        if not self._query_mentions_specific_user(message):
+            return False
+        
+        message_lower = message.lower()
+        
+        # Skip if user specifically asks for MODULE details (names, which modules, completion rate)
+        # These should go to module_consumption_data for detailed module info
+        module_detail_keywords = [
+            'which module', 'what module', 'module name', 'modules name',
+            'list module', 'show module', 'give me module', 'module completion',
+            'completion rate', 'completion %', 'completion percentage',
+            'what did they complete', 'which did they complete',
+            'modules completed', 'module they completed'
+        ]
+        if any(kw in message_lower for kw in module_detail_keywords):
+            return False
+        
+        # Trigger on completion info / activity requests (general info, not module-specific)
+        activity_info_keywords = [
+            'completion info', 'activity info', 'activity data',
+            'what did', 'how much', 'all of', 'everything',
+            'completion record', 'activity summary', 'learning activity',
+            'info of', 'info for', 'info on'
+        ]
+        if any(kw in message_lower for kw in activity_info_keywords):
+            return True
+        
+        # Also trigger if asking for generic "completions" for a user without module specifics
+        # Pattern: "[give me] completion[s] [of/for] user@email.com"
+        if 'completion' in message_lower and '@' in message_lower:
+            # But NOT if they say "module completion"
+            if 'module' not in message_lower:
+                return True
+        
+        return False
+    
+    def _extract_user_identifier_from_message(self, message: str) -> Optional[Dict[str, Any]]:
+        """Extract email or name from user message for activity lookup."""
+        import re
+        
+        # Try to find email first
+        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', message.lower())
+        if email_match:
+            return {'field': 'email_addr', 'value': email_match.group(0)}
+        
+        # Try to extract person name
+        person_name = self._extract_person_name(message)
+        if person_name:
+            return {'field': 'name', 'value': person_name}
+        
+        return None
+    
+    def _force_user_activity_summary_query(
+        self,
+        query_payload: Dict[str, Any],
+        identifier: Dict[str, Any],
+        time_period: Optional[TimePeriod]
+    ):
+        """Build deterministic daily activity summary query for a user."""
+        filters = [
+            {"term": {"status": 5}},
+            {"term": {"cmid": 1}}
+        ]
+        
+        field = identifier.get('field')
+        value = identifier.get('value')
+        
+        if field == 'email_addr' and isinstance(value, str):
+            filters.append({"term": {"email_addr": value.lower()}})
+        elif field == 'name' and value:
+            # Use name matching on first_name/last_name
+            filters.append({
+                "bool": {
+                    "should": [
+                        {"match": {"first_name": {"query": str(value), "fuzziness": "AUTO"}}},
+                        {"match": {"last_name": {"query": str(value), "fuzziness": "AUTO"}}}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })
+        elif field == 'uid':
+            filters.append({"term": {"uid": value}})
+        
+        if time_period and not time_period.is_lifetime:
+            filters.append({
+                "range": {
+                    "completed_on": {
+                        "gte": time_period.start_timestamp,
+                        "lt": time_period.end_timestamp
+                    }
+                }
+            })
+        
+        # Sum all activity metrics
+        aggs = {
+            f"{metric}_total": {
+                "sum": {"field": metric}
+            }
+            for metric in self.ALL_ACTIVITY_METRICS
+        }
+        
+        query_payload['query'] = {
+            "size": 0,
+            "query": {
+                "bool": {
+                    "filter": filters
+                }
+            },
+            "aggs": aggs
+        }
+    
+    def _convert_activity_summary_results(self, execution_result: Dict[str, Any]):
+        """Convert aggregation totals into tabular rows for the frontend."""
+        aggregations = execution_result.get('aggregations', {})
+        metric_labels = {
+            'module': 'Module completions',
+            'instant_answers': 'Instant answers',
+            'learning_pathway': 'Learning pathways',
+            'lotd': 'Learning of the day',
+            'points': 'Points',
+            'total_points': 'Total points'
+        }
+        rows = []
+        for metric in self.ALL_ACTIVITY_METRICS:
+            agg = aggregations.get(f"{metric}_total", {})
+            value = self._safe_int(agg.get('value')) or 0
+            rows.append({
+                'metric': metric_labels.get(metric, metric.replace('_', ' ').title()),
+                'count': value
+            })
+        
+        execution_result['results'] = rows
+        execution_result['count'] = len(rows)
+        execution_result['total'] = len(rows)
+    
+    def _is_module_catalog_count_request(self, message: Optional[str]) -> bool:
+        """Determine if the user only wants a count of modules (not a list)."""
+        if not message:
+            return False
+        message_lower = message.lower()
+        
+        positive_terms = ['how many', 'count', 'total number', 'number of', 'total modules']
+        if not any(term in message_lower for term in positive_terms):
+            return False
+        
+        # Require module-related context
+        if 'module' not in message_lower and 'training' not in message_lower:
+            return False
+        
+        negative_terms = ['which', 'list', 'show', 'give me', 'display', 'table', 'detail', 'module name']
+        if any(term in message_lower for term in negative_terms):
+            return False
+        
+        return True
+    
+    def _force_module_catalog_count_query(self, query_payload: Dict[str, Any]):
+        """Rewrite module catalog query to return only aggregate count."""
+        query_body = query_payload.get('query')
+        if not isinstance(query_body, dict):
+            query_body = query_payload['query'] = {}
+        
+        query_body['size'] = 0
+        query_body.pop('sort', None)
+        query_body.pop('from', None)
+        query_body.pop('collapse', None)
+        
+        aggs = query_body.setdefault('aggs', {})
+        aggs['module_total'] = {
+            "value_count": {
+                "field": "mid"
+            }
+        }
+
+    def _wants_activity_breakdown(self, user_message: Optional[str], response_type: Optional[ResponseType]) -> bool:
+        """Return True if user explicitly asked for a breakdown/list/chart of activity metrics."""
+        if not user_message:
+            return False
+        message_lower = user_message.lower()
+        breakdown_keywords = [
+            'graph', 'chart', 'visual', 'visualize', 'visualise', 'bar', 'line', 'pie', 'trend',
+            'over time', 'breakdown', 'per ', ' by ', 'each ', 'which ', 'who ', 'top',
+            'list', 'table', 'show me', 'compare', 'distribution'
+        ]
+        if any(keyword in message_lower for keyword in breakdown_keywords):
+            return True
+        if response_type in (
+            ResponseType.BAR_CHART,
+            ResponseType.LINE_CHART,
+            ResponseType.PIE_CHART,
+            ResponseType.TABLE
+        ):
+            return True
+        return False
+
+    def _detect_activity_metrics(self, user_message: Optional[str]) -> Set[str]:
+        """Detect which activity metrics (module/instant_answers/etc.) are mentioned in the message."""
+        if not user_message:
+            return set()
+        message_lower = user_message.lower()
+        tokens = self._tokenize_for_metric_detection(user_message)
+        detected: Set[str] = set()
+        for metric, keywords in self.ACTIVITY_METRIC_SYNONYMS.items():
+            for keyword in keywords:
+                if self._keyword_matches_message(keyword, message_lower, tokens):
+                    detected.add(metric)
+                    break
+        return detected
+
+    def _generate_activity_metric_message(
+        self,
+        query_results: Dict[str, Any],
+        original_query: str,
+        time_period: Optional[TimePeriod],
+        detected_metrics: Set[str]
+    ) -> Optional[str]:
+        """
+        Generate a clear, direct message for activity metric queries.
+        Returns None if no activity metrics found in results.
+        """
+        aggregations = query_results.get('aggregations', {})
+        if not aggregations:
+            return None
+        
+        # Map metric names to human-readable labels
+        metric_labels = {
+            'learning_pathway': 'learning pathways',
+            'instant_answers': 'instant answers',
+            'module': 'modules',
+            'lotd': 'learning of the day items',
+            'points': 'points',
+            'total_points': 'total points'
+        }
+        
+        # Extract user name from query if present
+        user_name = None
+        import re
+        name_patterns = [
+            r'\b(?:by|for|has)\s+([a-z]+(?:\s+[a-z]+)?)\b',  # "by ranjitha", "for tanuj"
+            r'\b([a-z]+(?:\s+[a-z]+)?)\s+(?:completed|has|in)\b',  # "ranjitha completed"
+        ]
+        query_lower = original_query.lower()
+        for pattern in name_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                potential_name = match.group(1).strip()
+                # Filter out common words that aren't names
+                skip_words = {'how', 'many', 'the', 'what', 'which', 'who', 'all', 'any', 'some', 
+                             'learning', 'pathway', 'pathways', 'module', 'modules', 'completed',
+                             'instant', 'answers', 'lotd', 'points', 'total', 'nov', 'november',
+                             'dec', 'december', 'jan', 'january', 'feb', 'february', 'data'}
+                if potential_name not in skip_words and len(potential_name) >= 2:
+                    user_name = potential_name.title()
+                    break
+        
+        # Build time context
+        time_context = ""
+        if time_period and not time_period.is_lifetime:
+            time_context = f" in {time_period.description}"
+        
+        # Extract values from aggregations and build message parts
+        metric_parts = []
+        for metric in detected_metrics:
+            agg_name = f"{metric}_total"
+            if agg_name in aggregations:
+                agg_value = aggregations[agg_name]
+                value = None
+                if isinstance(agg_value, dict) and 'value' in agg_value:
+                    value = agg_value['value']
+                elif isinstance(agg_value, (int, float)):
+                    value = agg_value
+                
+                if value is not None:
+                    # Convert to int for display
+                    value_int = int(value) if value is not None else 0
+                    label = metric_labels.get(metric, metric.replace('_', ' '))
+                    metric_parts.append((label, value_int))
+        
+        if not metric_parts:
+            return None
+        
+        # Generate the message
+        if len(metric_parts) == 1:
+            label, value = metric_parts[0]
+            if user_name:
+                return f"{user_name} completed {value:,} {label}{time_context}."
+            else:
+                return f"Found {value:,} {label}{time_context}."
+        else:
+            # Multiple metrics
+            parts_str = ", ".join(f"{value:,} {label}" for label, value in metric_parts)
+            if user_name:
+                return f"{user_name} has: {parts_str}{time_context}."
+            else:
+                return f"Found: {parts_str}{time_context}."
+
+    def _ensure_activity_metric_aggregation(
+        self,
+        query_payload: Dict[str, Any],
+        metrics: Set[str],
+        index_id: Optional[str],
+        user_message: Optional[str] = None,
+        response_type: Optional[ResponseType] = None
+    ):
+        """
+        Force KPI-style aggregations (size:0 + sum) for activity metric queries on daily/monthly indexes.
+        """
+        if index_id not in ('daily_user_activity_data', 'monthly_user_activity_data'):
+            return
+        if not isinstance(query_payload, dict):
+            return
+        if self._wants_activity_breakdown(user_message, response_type):
+            logger.info("Detected activity breakdown/graph request - skipping KPI enforcement")
+            return
+
+        query_body = query_payload.setdefault('query', {})
+        if not isinstance(query_body, dict):
+            query_body = query_payload['query'] = {}
+        
+        # Force size: 0 to avoid raw rows
+        query_body['size'] = 0
+        
+        valid_fields = set(self.ALL_ACTIVITY_METRICS)
+        aggs = query_body.setdefault('aggs', {})
+        if not isinstance(aggs, dict):
+            aggs = query_body['aggs'] = {}
+
+        # If user mentioned any specific metrics, use them; otherwise when the request is generic
+        # (e.g., “engagement” or “learning activity”) include all metrics so UI can display each.
+        metric_list = list(metrics) if metrics else list(self.ALL_ACTIVITY_METRICS)
+
+        for metric in metric_list:
+            if metric not in valid_fields:
+                continue
+            agg_name = f"{metric}_total"
+            aggs[agg_name] = {
+                "sum": {
+                    "field": metric
+                }
+            }
+
+    def _ensure_activity_metric_filters(self, query_body: Dict[str, Any], metrics: Set[str]):
+        """Ensure listing queries on activity indexes still filter by the requested metric fields."""
+        if not metrics or not isinstance(query_body, dict):
+            return
+        query = query_body.setdefault('query', {})
+        if not isinstance(query, dict):
+            return
+        bool_query = query.setdefault('bool', {})
+        if not isinstance(bool_query, dict):
+            return
+        filters = bool_query.setdefault('filter', [])
+        if not isinstance(filters, list):
+            bool_query['filter'] = filters = []
+
+        def has_metric_filter(field: str) -> bool:
+            for clause in filters:
+                if not isinstance(clause, dict):
+                    continue
+                if 'range' in clause and isinstance(clause['range'], dict) and field in clause['range']:
+                    return True
+                if 'term' in clause and isinstance(clause['term'], dict) and field in clause['term']:
+                    return True
+            return False
+
+        for metric in metrics:
+            if has_metric_filter(metric):
+                continue
+            filters.append({"range": {metric: {"gt": 0}}})
+            logger.info(f"Added range filter {metric} > 0 for activity listing query")
 
     def _validate_bool_query(self, query: Dict[str, Any]):
         """Validate and clean bool query structure to prevent parsing errors."""
@@ -2423,13 +3252,22 @@ class QueryOrchestrator:
         import re
         message_lower = user_message.lower()
         # Check for patterns like "completion rate of X" or "what is the completion rate of X"
+        # Also match "what is X completion rate" (module name between "what is" and "completion rate")
         patterns = [
             r'completion\s+rate\s+(?:of|for)',
             r'what\s+(?:is|was)\s+(?:the\s+)?completion\s+rate',
+            r'what\s+(?:is|was)\s+.+\s+completion\s+rate',  # "what is X completion rate"
             r'completion\s+%',
             r'completion\s+percentage',
+            r'\bcompletion\s+rate\b',  # Any "completion rate" phrase
         ]
         has_completion_rate = any(re.search(pattern, message_lower) for pattern in patterns)
+
+        # If an email is present, this is almost certainly a USER completion rate request, not a module.
+        # Example: "completion rate for tanuj@bsharpcorp.com"
+        if has_completion_rate and re.search(r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', user_message, re.IGNORECASE):
+            return False
+
         # Also check if it mentions a module name (not just general completion rate)
         # Look for module name patterns or check if there's text after "of" or "for"
         has_module_mention = (
@@ -2455,6 +3293,20 @@ class QueryOrchestrator:
             r'what\s+(?:is|was)\s+(?:the\s+)?completion\s+rate',
         ]
         has_completion_rate = any(re.search(pattern, message_lower) for pattern in completion_patterns)
+
+        # Fast-path: email present + completion rate => USER completion rate
+        # (These queries often omit explicit "user"/"learner" keywords.)
+        if has_completion_rate:
+            email_match = re.search(
+                r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+                user_message,
+                re.IGNORECASE
+            )
+            if email_match:
+                logger.info(
+                    f"Detected email in completion rate query - treating as USER completion rate (email: {email_match.group(0)})"
+                )
+                return True
         
         # Check if there's a name/email mentioned BEFORE timeframe keywords
         # Patterns like: "tanuj in the last 3 months", "tanuj's completion rate", "completion rate of tanuj"
@@ -2512,103 +3364,215 @@ class QueryOrchestrator:
             user_identifier = re.sub(r"'s\s*$", "", user_identifier, flags=re.IGNORECASE)
             user_identifier = user_identifier.strip()
             
-            # Use OpenSearchClient directly for simpler execution
             os_client = self.os_client
-            
-            # Determine if it's an email or name
             is_email = '@' in user_identifier
+            search_indexes = self._get_user_lookup_index_order(index_id)
             
-            if is_email:
-                # EMAIL: Simple direct match on email_addr field (case-insensitive)
-                email_lower = user_identifier.lower().strip()
-                lookup_query = {
-                    "size": 1,
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {"term": {"user_status": 5}},
-                                {"term": {"email_addr": email_lower}}  # CRITICAL: Use term query for exact match on email_addr
-                            ]
-                        }
-                    },
-                    "_source": ["uid", "email_addr", "first_name", "last_name"]
-                }
-                logger.info(f"Looking up UID by email: {email_lower}")
-            else:
-                # NAME: Split into parts
-                name_parts = user_identifier.split()
-                if len(name_parts) >= 2:
-                    # FULL NAME: first_name AND last_name
-                    first_name = name_parts[0].strip()
-                    last_name = ' '.join(name_parts[1:]).strip()
-                    lookup_query = {
-                        "size": 10,
-                        "query": {
-                            "bool": {
-                                "filter": [
-                                    {"term": {"user_status": 5}}
-                                ],
-                                "must": [
-                                    {"match": {"first_name": {"query": first_name, "operator": "and"}}},
-                                    {"match": {"last_name": {"query": last_name, "operator": "and"}}}
-                                ]
-                            }
-                        },
-                        "_source": ["uid", "first_name", "last_name", "email_addr"]
-                    }
-                else:
-                    # SINGLE NAME: first_name OR last_name
-                    single_name = name_parts[0].strip() if name_parts else user_identifier
-                    lookup_query = {
-                        "size": 10,
-                        "query": {
-                            "bool": {
-                                "filter": [
-                                    {"term": {"user_status": 5}}
-                                ],
-                                "should": [
-                                    {"match": {"first_name": {"query": single_name, "operator": "and"}}},
-                                    {"match": {"last_name": {"query": single_name, "operator": "and"}}}
-                                ],
-                                "minimum_should_match": 1
-                            }
-                        },
-                        "_source": ["uid", "first_name", "last_name", "email_addr"]
-                    }
+            name_parts = user_identifier.split()
+            first_name = name_parts[0].strip() if name_parts else None
+            last_name = ' '.join(name_parts[1:]).strip() if len(name_parts) >= 2 else None
+            single_name = None if len(name_parts) >= 2 else (name_parts[0].strip() if name_parts else user_identifier)
+            email_lower = user_identifier.lower().strip() if is_email else None
             
-            # Execute lookup query directly via OpenSearchClient
-            lookup_result = os_client.execute_query(index_id=index_id, query=lookup_query, size=10)
-            
-            if lookup_result.get('success') and lookup_result.get('results'):
-                results = lookup_result['results']
+            for lookup_index in search_indexes:
+                lookup_query = self._build_user_lookup_query(
+                    lookup_index,
+                    is_email=is_email,
+                    email_lower=email_lower,
+                    first_name=first_name,
+                    last_name=last_name,
+                    single_name=single_name
+                )
                 
-                # For email: get uid directly from first result (query already filtered by exact email)
+                if not lookup_query:
+                    continue
+                
+                lookup_result = os_client.execute_query(index_id=lookup_index, query=lookup_query, size=10)
+                if not (lookup_result.get('success') and lookup_result.get('results')):
+                    continue
+                
+                results = lookup_result['results']
+                if not results:
+                    continue
+                
                 if is_email:
-                    if results:
-                        uid = results[0].get('uid')
-                        if uid:
-                            result_email = results[0].get('email_addr', '')
-                            logger.info(f"Found uid {uid} for email '{user_identifier}' (matched: {result_email})")
-                            return int(uid)
-                    logger.warning(f"No user found for email '{user_identifier}'")
-                    return None
+                    uid = results[0].get('uid') or results[0].get('id')
+                    if uid:
+                        logger.info(f"Found uid {uid} for email '{user_identifier}' using index '{lookup_index}'")
+                        return int(uid)
                 else:
-                    # For names: use first result (already filtered by query)
-                    if results:
-                        uid = results[0].get('uid')
+                    best_match = self._select_best_name_candidate(
+                        results,
+                        first_name=first_name if len(name_parts) >= 2 else None,
+                        last_name=last_name if len(name_parts) >= 2 else None,
+                        single_name=single_name if len(name_parts) < 2 else None
+                    )
+                    if best_match:
+                        uid = best_match.get('uid') or best_match.get('id')
                         if uid:
-                            name = f"{results[0].get('first_name', '')} {results[0].get('last_name', '')}".strip()
-                            logger.info(f"Found uid {uid} for name '{user_identifier}' (matched: {name})")
-                            if len(results) > 1:
-                                logger.warning(f"Multiple matches for '{user_identifier}': {len(results)} results. Using first: uid={uid}")
+                            name = f"{best_match.get('first_name', '')} {best_match.get('last_name', '')}".strip()
+                            logger.info(
+                                f"Found uid {uid} for name '{user_identifier}' (matched: {name}) using index '{lookup_index}'"
+                            )
                             return int(uid)
             
-            logger.warning(f"Could not find uid for user identifier '{user_identifier}'")
+            logger.warning(f"Could not find uid for user identifier '{user_identifier}' in indexes: {search_indexes}")
             return None
             
         except Exception as e:
             logger.error(f"Error looking up user uid for '{user_identifier}': {str(e)}", exc_info=True)
             return None
+
+    def _get_user_lookup_index_order(self, primary_index_id: str) -> List[str]:
+        """Determine which indexes to use (in order) when resolving a user name/email."""
+        order: List[str] = []
+        if primary_index_id:
+            order.append(primary_index_id)
+        if 'user_profile_data' not in order:
+            order.append('user_profile_data')
+        if 'module_consumption_data' not in order:
+            order.append('module_consumption_data')
+        
+        seen = set()
+        ordered: List[str] = []
+        for idx in order:
+            if idx and idx not in seen:
+                ordered.append(idx)
+                seen.add(idx)
+        return ordered
+
+    def _build_user_lookup_query(
+        self,
+        index_id: str,
+        is_email: bool,
+        email_lower: Optional[str],
+        first_name: Optional[str],
+        last_name: Optional[str],
+        single_name: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Build a user lookup query tailored to the given index."""
+        if not index_id:
+            return None
+        
+        status_field = 'status' if index_id == 'user_profile_data' else 'user_status'
+        base_filter = [{"term": {status_field: 5}}]
+        
+        if is_email:
+            if not email_lower:
+                return None
+            return {
+                "size": 5,
+                    "query": {
+                        "bool": {
+                        "filter": base_filter,
+                        # Email fields are sometimes mapped as text (analyzed) in some indexes.
+                        # Use a should-clause so we can match both keyword-style and analyzed mappings.
+                        "should": [
+                            {"term": {"email_addr": email_lower}},
+                            {"match": {"email_addr": {"query": email_lower, "operator": "and"}}},
+                        ],
+                        "minimum_should_match": 1
+                    }
+                },
+                "_source": ["uid", "id", "email_addr", "first_name", "last_name"]
+            }
+        
+        # Name-based lookup
+        if first_name and last_name:
+            should_clause = [
+                                    {"match": {"first_name": {"query": first_name, "operator": "and"}}},
+                                    {"match": {"last_name": {"query": last_name, "operator": "and"}}}
+                                ]
+        else:
+            value = single_name or first_name or last_name
+            if not value:
+                return None
+            should_clause = [
+                {"match": {"first_name": {"query": value, "operator": "and"}}},
+                {"match": {"last_name": {"query": value, "operator": "and"}}}
+            ]
+        
+        return {
+                        "size": 10,
+                        "query": {
+                            "bool": {
+                    "filter": base_filter,
+                    "should": should_clause,
+                                "minimum_should_match": 1
+                            }
+                        },
+            "_source": ["uid", "id", "first_name", "last_name", "email_addr"]
+        }
+
+    def _select_best_name_candidate(
+        self,
+        candidates: List[Dict[str, Any]],
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        single_name: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Given a list of candidate documents, pick the one that best matches the provided name parts.
+        Prefers exact matches on both first and last names, then partial matches, then falls back.
+        """
+        if not candidates:
+            return None
+        
+        target_first = (first_name or "").strip().lower()
+        target_last = (last_name or "").strip().lower()
+        target_single = (single_name or "").strip().lower()
+        
+        best_candidate = None
+        best_score = -1
+        
+        for candidate in candidates:
+            uid = candidate.get('uid')
+            if uid is None:
+                continue
+            
+            candidate_first = str(candidate.get('first_name', '') or '').strip().lower()
+            candidate_last = str(candidate.get('last_name', '') or '').strip().lower()
+            
+            score = 0
+            
+            if target_first:
+                if candidate_first == target_first:
+                    score += 3
+                elif candidate_first.startswith(target_first):
+                    score += 2
+                elif target_first in candidate_first:
+                    score += 1
+            
+            if target_last:
+                if candidate_last == target_last:
+                    score += 3
+                elif candidate_last.startswith(target_last):
+                    score += 2
+                elif target_last in candidate_last:
+                    score += 1
+            
+            if target_first and target_last:
+                # Bonus when both names match strongly
+                if candidate_first == target_first and candidate_last == target_last:
+                    score += 3
+            
+            if target_single:
+                if candidate_first == target_single or candidate_last == target_single:
+                    score += 3
+                elif candidate_first.startswith(target_single) or candidate_last.startswith(target_single):
+                    score += 2
+                elif target_single in candidate_first or target_single in candidate_last:
+                    score += 1
+            
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+        
+        if best_candidate is None:
+            # Fallback to first candidate if scoring failed
+            best_candidate = candidates[0]
+        
+        return best_candidate
     
     def _force_module_completion_rate_query_structure(self, query_payload: Dict[str, Any], user_message: str):
         """
@@ -2639,17 +3603,22 @@ class QueryOrchestrator:
             # Simple extraction - look for quoted text or text after "of" or "for"
             import re
             # Look for patterns like "completion rate of X" or "completion rate for X"
+            # Also handle "what is X module completion rate"
             patterns = [
-                r'completion\s+rate\s+(?:of|for)\s+["\']?([^"\']+)["\']?',
-                r'completion\s+rate\s+["\']?([^"\']+)["\']?',
+                r'completion\s+rate\s+(?:of|for)\s+["\']?([^"\']+?)["\']?\s*(?:\?|$)',
+                r'what\s+(?:is|was)\s+(?:the\s+)?["\']?(.+?)["\']?\s+(?:module\s+)?completion\s+rate',  # "what is X completion rate"
+                r'["\']?(.+?)["\']?\s+(?:module\s+)?completion\s+rate',  # "X completion rate"
             ]
             for pattern in patterns:
                 match = re.search(pattern, user_message, re.IGNORECASE)
                 if match:
                     module_name = match.group(1).strip()
-                    # Remove trailing punctuation
+                    # Remove trailing punctuation and common words
                     module_name = re.sub(r'[?.!]+$', '', module_name)
-                    break
+                    # Remove "the" from start if present
+                    module_name = re.sub(r'^the\s+', '', module_name, flags=re.IGNORECASE)
+                    if module_name and len(module_name) > 2:
+                        break
         
         # Build the exact query structure
         query_body['size'] = 0
@@ -2759,57 +3728,70 @@ class QueryOrchestrator:
             import re
             message_lower = user_message.lower()
             
-            # CRITICAL: Extract user name BEFORE timeframe phrases
-            # Patterns to extract user name - handle cases like:
-            # - "tanuj completion rate"
-            # - "tanuj's completion rate"  
-            # - "completion rate of tanuj"
-            # - "tanuj in the last 3 months" (completion rate implied)
-            # - "what is tanuj's completion rate in the last 3 months"
+            # PRIORITY 1: Extract email address FIRST (most reliable identifier)
+            email_match = re.search(r'\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b', user_message, re.IGNORECASE)
+            if email_match:
+                user_identifier = email_match.group(1).strip().lower()
+                logger.info(f"Extracted email identifier '{user_identifier}' from message")
             
-            # First, try to find a name/email at the start or before completion/timeframe keywords
-            # Extract text before "completion rate", "in the last", "this month", etc.
-            timeframe_keywords = ['in the last', 'this month', 'last month', 'this quarter', 'last quarter', 'this year', 'last year', 'completion rate', 'completion']
+            # PRIORITY 2: Extract user name BEFORE timeframe phrases (if no email found)
+            if not user_identifier:
+                # Patterns to extract user name - handle cases like:
+                # - "tanuj completion rate"
+                # - "tanuj's completion rate"
+                # - "completion rate of tanuj"
+                # - "tanuj in the last 3 months" (completion rate implied)
+                # - "what is tanuj's completion rate in the last 3 months"
+
+                # Extract text before "completion rate", "in the last", "this month", etc.
+                timeframe_keywords = [
+                    'in the last', 'this month', 'last month',
+                    'this quarter', 'last quarter', 'this year',
+                    'last year', 'completion rate', 'completion'
+                ]
+
+                # Find the earliest occurrence of any timeframe/completion keyword
+                earliest_keyword_pos = len(user_message)
+                for keyword in timeframe_keywords:
+                    pos = message_lower.find(keyword)
+                    if pos != -1 and pos < earliest_keyword_pos:
+                        earliest_keyword_pos = pos
+
+                # Extract potential user identifier before the keyword
+                if earliest_keyword_pos < len(user_message):
+                    before_keyword = user_message[:earliest_keyword_pos].strip()
+                    # Remove leading question words
+                    before_keyword = re.sub(
+                        r'^(?:what|is|was|the|a|an|for|of|show|get|give)\s+',
+                        '',
+                        before_keyword,
+                        flags=re.IGNORECASE
+                    )
+                    before_keyword = before_keyword.strip()
+
+                    if before_keyword:
+                        name_match = re.search(
+                            r'\b([a-z]{2,30}(?:[\s-][a-z]{2,30}){0,3})\b',
+                            before_keyword,
+                            re.IGNORECASE
+                        )
+                        if name_match:
+                            potential_name = name_match.group(1).strip()
+                            potential_name = re.sub(r'[?.!,;]+$', '', potential_name).strip()
+
+                            if potential_name and len(potential_name) >= 2:
+                                metric_words = ['com', 'completion', 'rate', 'completions', 'percent', 'percentage', 'the', 'a', 'an']
+                                if potential_name.lower() not in metric_words:
+                                    if (
+                                        potential_name.replace(' ', '').replace('-', '').isalpha()
+                                        and len(potential_name.split()) <= 5
+                                    ):
+                                        user_identifier = potential_name
+                                        logger.info(
+                                            f"Extracted name identifier '{user_identifier}' from message before timeframe keyword"
+                                        )
             
-            # Find the earliest occurrence of any timeframe/completion keyword
-            earliest_keyword_pos = len(user_message)
-            for keyword in timeframe_keywords:
-                pos = message_lower.find(keyword)
-                if pos != -1 and pos < earliest_keyword_pos:
-                    earliest_keyword_pos = pos
-            
-            # Extract potential user identifier before the keyword
-            if earliest_keyword_pos < len(user_message):
-                before_keyword = user_message[:earliest_keyword_pos].strip()
-                # Remove leading question words
-                before_keyword = re.sub(r'^(?:what|is|was|the|a|an|for|of|show|get|give)\s+', '', before_keyword, flags=re.IGNORECASE)
-                before_keyword = before_keyword.strip()
-                
-                # Look for name patterns in the text before the keyword
-                # Pattern: word(s) that could be a name (2-30 chars, letters/spaces/hyphens)
-                if before_keyword:
-                    # Try to extract a name - could be single word or multiple words
-                    # Match: word(s) that are likely names (not common words)
-                    name_match = re.search(r'\b([a-z]{2,30}(?:[\s-][a-z]{2,30}){0,3})\b', before_keyword, re.IGNORECASE)
-                    if name_match:
-                        potential_name = name_match.group(1).strip()
-                        # Remove trailing punctuation
-                        potential_name = re.sub(r'[?.!,;]+$', '', potential_name)
-                        potential_name = potential_name.strip()
-                        
-                        # Check if it's a valid name/email
-                        if potential_name and len(potential_name) >= 2:
-                            metric_words = ['com', 'completion', 'rate', 'completions', 'percent', 'percentage', 'the', 'a', 'an']
-                            if potential_name.lower() not in metric_words:
-                                # Check if it looks like an email or name
-                                if '@' in potential_name:
-                                    user_identifier = potential_name
-                                    logger.info(f"Extracted email identifier '{user_identifier}' from message before timeframe keyword")
-                                elif potential_name.replace(' ', '').replace('-', '').isalpha() and len(potential_name.split()) <= 5:
-                                    user_identifier = potential_name
-                                    logger.info(f"Extracted name identifier '{user_identifier}' from message before timeframe keyword")
-            
-            # If still no identifier, try standard patterns
+            # PRIORITY 3: Try standard patterns (if still no identifier)
             if not user_identifier:
                 patterns = [
                     r'\b([a-z]{2,30}(?:\s+[a-z]{2,30}){0,3})\'?s?\s+completion\s+rate\b',  # "Tanuj's completion rate" or "Tanuj Sadasivam's completion rate"
@@ -2846,8 +3828,8 @@ class QueryOrchestrator:
                                 logger.info(f"Extracted user identifier '{user_identifier}' using pattern matching (name)")
                                 break
         
-        # FALLBACK: If still no identifier, check if LLM incorrectly put it in module_name
-        # This is a LAST RESORT - we extract it, then immediately remove module_name and use UID
+        # FALLBACK: If still no identifier, check query filters for email_addr or module_name
+        # This is a LAST RESORT - we extract it, then rebuild the query properly
         if not user_identifier:
             query = query_body.get('query', {})
             if isinstance(query, dict):
@@ -2856,6 +3838,26 @@ class QueryOrchestrator:
                     filter_clauses = bool_query.get('filter', [])
                     for clause in filter_clauses:
                         if isinstance(clause, dict):
+                            # PRIORITY: Check for email_addr filters (term or match)
+                            if 'term' in clause and isinstance(clause['term'], dict):
+                                if 'email_addr' in clause['term']:
+                                    email_val = clause['term']['email_addr']
+                                    if email_val and '@' in str(email_val):
+                                        user_identifier = str(email_val).strip().lower()
+                                        logger.info(f"FALLBACK: Extracted email '{user_identifier}' from email_addr term filter")
+                                        break
+                            if 'match' in clause and isinstance(clause['match'], dict):
+                                if 'email_addr' in clause['match']:
+                                    email_clause = clause['match']['email_addr']
+                                    if isinstance(email_clause, dict):
+                                        email_val = email_clause.get('query', '')
+                                    else:
+                                        email_val = str(email_clause)
+                                    if email_val and '@' in email_val:
+                                        user_identifier = email_val.strip().lower()
+                                        logger.info(f"FALLBACK: Extracted email '{user_identifier}' from email_addr match filter")
+                                        break
+                            
                             # Check for module_name match_phrase (LLM often puts user names here)
                             if 'match_phrase' in clause and isinstance(clause['match_phrase'], dict):
                                 if 'module_name' in clause['match_phrase']:
@@ -2912,8 +3914,28 @@ class QueryOrchestrator:
         else:
             logger.error("No user identifier extracted from message - cannot build user completion rate query")
         
-        if not uid:
-            logger.error(f"Could not find uid for user '{user_identifier}', cannot build user completion rate query")
+        # If UID lookup fails but we have an email, fall back to filtering by email_addr.
+        # This keeps completion rate working even when email_addr is mapped as analyzed text in the index.
+        user_filter_clause: Optional[Dict[str, Any]] = None
+        if uid:
+            user_filter_clause = {"term": {"uid": uid}}
+        else:
+            if user_identifier and '@' in user_identifier:
+                email_val = user_identifier.strip().lower()
+                user_filter_clause = {
+                    "bool": {
+                        "should": [
+                            {"term": {"email_addr": email_val}},
+                            {"match": {"email_addr": {"query": email_val, "operator": "and"}}}
+                        ],
+                        "minimum_should_match": 1
+                    }
+                }
+                logger.warning(
+                    f"UID lookup failed for '{user_identifier}'. Falling back to email_addr filter for completion rate query."
+                )
+            else:
+                logger.error(f"Could not find uid for user '{user_identifier}', cannot build user completion rate query")
             return
         
         # CRITICAL: Completely rebuild the query structure from scratch
@@ -2926,7 +3948,7 @@ class QueryOrchestrator:
                     {"term": {"module_status": 0}},  # CRITICAL: Always include for assigned modules
                     {"term": {"assigned_status": 0}},
                     {"term": {"cmid": 1}},
-                    {"term": {"uid": uid}}  # CRITICAL: Use UID, NOT module_name or name fields
+                    user_filter_clause  # uid term when available, otherwise email_addr fallback
                 ],
                 "should": [],
                 "must_not": []
@@ -3346,29 +4368,29 @@ class QueryOrchestrator:
     
     def _has_top_level_completion_rate_pipeline(self, aggs: Dict[str, Any]) -> bool:
         """
-        Return True if any bucket_script aggregation exists at the top level (needs wrapping).
-        Checks for ANY bucket_script regardless of name (completion_rate, calculate_rate, etc.).
+        Return True if any pipeline aggregation (e.g., bucket_script) exists at the TOP LEVEL of the
+        provided aggs dict. Pipeline aggregations cannot be declared at the root of a query; they
+        must be nested under a bucket aggregation.
         """
         if not isinstance(aggs, dict):
             return False
         
-        # SIMPLE: Recursively check ALL aggregations for bucket_script
-        def check_for_bucket_script(agg_dict: Dict[str, Any], path: str = "") -> bool:
-            if not isinstance(agg_dict, dict):
-                return False
-            # Check if this is a bucket_script
-            if 'bucket_script' in agg_dict:
-                logger.info(f"Found bucket_script at: {path}")
+        pipeline_keys = (
+            'bucket_script',
+            'bucket_selector',
+            'bucket_sort',
+            'derivative',
+            'cumulative_sum',
+        )
+
+        for name, agg in aggs.items():
+            if isinstance(agg, dict):
+                present = [k for k in pipeline_keys if k in agg]
+                if present:
+                    logger.info(f"Found top-level pipeline aggregation '{name}' (keys: {present})")
                 return True
-            # Check all sub-aggregations
-            for key, value in agg_dict.items():
-                if key == 'aggs' and isinstance(value, dict):
-                    for sub_key, sub_value in value.items():
-                        if check_for_bucket_script(sub_value, f"{path}.{sub_key}" if path else sub_key):
-                            return True
+
         return False
-        
-        return check_for_bucket_script(aggs)
     
     def _get_completion_rate_inner_aggs(self, aggs: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Return the inner aggregation map for completion rate KPIs, handling scope wrapper if present."""
@@ -3956,7 +4978,8 @@ class QueryOrchestrator:
                             # Get module_count from aggregation (already calculated)
                             module_count = 0
                             if 'module_count' in bucket:
-                                module_count = bucket['module_count'].get('value', 0)
+                                raw_count = bucket['module_count'].get('value', 0)
+                                module_count = int(raw_count) if raw_count is not None else 0
                             
                             # Extract user details from top_hits if available
                             user_data = {}
@@ -3973,7 +4996,7 @@ class QueryOrchestrator:
                             row = {
                                 'uid': int(user_key) if is_uid else None,
                                 'email_addr': str(user_key) if is_email else None,
-                                'modules_completed': int(module_count)
+                                'modules_completed': module_count
                             }
                             
                             # Add user fields from top_hits
@@ -4100,6 +5123,63 @@ class QueryOrchestrator:
         self._fix_date_histograms(query_payload, time_period=time_period, time_field=time_field)
         # CRITICAL: Validate and fix bool query structures to prevent "Unknown key" errors
         self._validate_and_fix_bool_queries(query_payload)
+
+    def _normalize_query_envelope(self, query_payload: Dict[str, Any]):
+        """
+        Ensure the query payload has the standard structure:
+        {
+            "size": ...,
+            "query": { "bool": { ... } },
+            ...
+        }
+        Merge any top-level bool/filter blocks into query.bool to avoid parsing exceptions.
+        """
+        if not isinstance(query_payload, dict):
+            return
+        
+        query_body = query_payload.get('query')
+        reserved_root_keys = {
+            'query', 'size', 'from', 'sort', '_source', 'stored_fields', 'track_total_hits',
+            'aggs', 'aggregations', 'highlight', 'collapse', 'pit', 'runtime_mappings'
+        }
+        
+        if not isinstance(query_body, dict):
+            # Treat non-reserved keys as the query body
+            query_content = {}
+            for key in list(query_payload.keys()):
+                if key not in reserved_root_keys:
+                    query_content[key] = query_payload.pop(key)
+            if not query_content:
+                query_content = {"match_all": {}}
+            query_payload['query'] = query_content
+            query_body = query_content
+        
+        # Merge top-level bool (if present) into query.bool
+        root_bool = query_payload.pop('bool', None)
+        if isinstance(root_bool, dict):
+            target_bool = self._ensure_bool_query(query_body)
+            self._merge_bool_clauses(target_bool, root_bool)
+
+    def _merge_bool_clauses(self, target_bool: Dict[str, Any], source_bool: Dict[str, Any]):
+        """Merge filter/must/should/must_not clauses from source into target bool."""
+        if not isinstance(target_bool, dict) or not isinstance(source_bool, dict):
+            return
+        
+        for key in ('filter', 'must', 'should', 'must_not'):
+            src_clauses = source_bool.get(key)
+            if not src_clauses:
+                continue
+            if not isinstance(src_clauses, list):
+                src_clauses = [src_clauses]
+            tgt_clauses = target_bool.setdefault(key, [])
+            if not isinstance(tgt_clauses, list):
+                tgt_clauses = target_bool[key] = [tgt_clauses]
+            tgt_clauses.extend(src_clauses)
+        
+        if 'minimum_should_match' in source_bool and 'minimum_should_match' not in target_bool:
+            target_bool['minimum_should_match'] = source_bool['minimum_should_match']
+        if 'boost' in source_bool and 'boost' not in target_bool:
+            target_bool['boost'] = source_bool['boost']
     
     def _validate_and_remove_invalid_fields(
         self,
@@ -4491,7 +5571,19 @@ class QueryOrchestrator:
                 'correct_field': {
                     'user_status': 'status',
                     'completed_date': 'completed_on',
-                    'uid': 'id'
+                    'id': 'uid'
+                }
+            },
+            'daily_user_activity_data': {
+                # Daily user activity index stores DAILY per-user COUNTS/POINTS (not event-level completions)
+                'invalid_fields': ['module_status', 'assigned_status', 'completed_status',
+                                 'complete_percentage', 'complete_type', 'complete_version', 'comments',
+                                 'module_name', 'mid', 'published_date', 'estd_time', 'module_points',
+                                 'ratings', 'invited_date', 'invited_time'],
+                'correct_field': {
+                    'user_status': 'status',
+                    'completed_date': 'completed_on',
+                    'id': 'uid'
                 }
             },
             'module_consumption_data': {
@@ -4530,7 +5622,7 @@ class QueryOrchestrator:
                     current_path = f"{path}.{key}" if path else key
                     
                     # Replace field aliases in aggregation configs, collapse, _source, sort, etc.
-                    # (Needed for monthly_user_activity_data where the user id field is "id" and time anchor is "completed_on")
+                    # (Needed for monthly/daily activity indexes where the user id field is "id" and time anchor is "completed_on")
                     if key in ['terms', 'cardinality', 'avg', 'sum', 'min', 'max', 'stats', 'value_count', 'date_histogram']:
                         if isinstance(value, dict) and isinstance(value.get('field'), str):
                             field_value = value.get('field')
@@ -5141,8 +6233,8 @@ class QueryOrchestrator:
                 is_consumption_index = True
             elif index_id == 'module_catalog_data':
                 is_catalog_index = True
-            elif index_id in ('user_profile_data', 'monthly_user_activity_data'):
-                # User profile / monthly activity indices have no module fields - do nothing
+            elif index_id in ('user_profile_data', 'monthly_user_activity_data', 'daily_user_activity_data'):
+                # User profile / activity summary indices have no module fields - do nothing
                 return
         else:
             # Check if it's the actual index name
@@ -5150,7 +6242,7 @@ class QueryOrchestrator:
                 is_consumption_index = True
             elif 'summary_reports' in str(index_id).lower() and 'consumption' not in str(index_id).lower():
                 is_catalog_index = True
-            elif 'monthly_user_activity' in str(index_id).lower():
+            elif 'monthly_user_activity' in str(index_id).lower() or 'daily_user_activity' in str(index_id).lower():
                 return
         
         # CRITICAL: For catalog index, DO NOT add module_status - it doesn't exist!
@@ -5428,38 +6520,97 @@ class QueryOrchestrator:
         replace_in_dict(query_payload)
     
     def _deduplicate_filters(self, query_payload: Dict[str, Any]):
-        """Remove duplicate filter clauses from the query."""
-        query_body = query_payload.get('query', {})
+        """Remove duplicate bool clauses anywhere in the query payload."""
+        query_body = query_payload.get('query')
         if not isinstance(query_body, dict):
             return
-        
-        query = query_body.get('query', {})
-        if not isinstance(query, dict):
+
+        def serialize_clause(clause: Any) -> str:
+            if isinstance(clause, (dict, list)):
+                try:
+                    return json.dumps(clause, sort_keys=True, separators=(',', ':'))
+                except TypeError:
+                    return str(clause)
+            return str(clause)
+
+        def dedup_bool(node: Dict[str, Any]):
+            if not isinstance(node, dict):
+                return
+
+            for clause_type in ['must', 'filter', 'should', 'must_not']:
+                clauses = node.get(clause_type)
+                if not isinstance(clauses, list):
+                    continue
+
+                seen = set()
+                unique = []
+                for clause in clauses:
+                    # Recurse into nested bool clauses before comparing
+                    if isinstance(clause, dict):
+                        inner_bool = clause.get('bool')
+                        if isinstance(inner_bool, dict):
+                            dedup_bool(inner_bool)
+
+                    serialized = serialize_clause(clause)
+                    if serialized not in seen:
+                        seen.add(serialized)
+                        unique.append(clause)
+
+                if len(unique) < len(clauses):
+                    node[clause_type] = unique
+                    logger.info(f"Removed {len(clauses) - len(unique)} duplicate {clause_type} clauses")
+
+        def traverse(obj: Any):
+            if isinstance(obj, dict):
+                if 'bool' in obj and isinstance(obj['bool'], dict):
+                    dedup_bool(obj['bool'])
+                for value in obj.values():
+                    traverse(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    traverse(item)
+
+        traverse(query_body)
+    
+    def _deduplicate_aggregations(self, query_payload: Dict[str, Any]):
+        """Collapse duplicate aggregations that perform the same calculation."""
+        query_body = query_payload.get('query')
+        if not isinstance(query_body, dict):
             return
-        
-        bool_query = query.get('bool', {})
-        if not isinstance(bool_query, dict):
-            return
-        
-        # Deduplicate 'must' and 'filter' arrays
-        for clause_type in ['must', 'filter', 'should', 'must_not']:
-            clauses = bool_query.get(clause_type, [])
-            if not isinstance(clauses, list):
-                continue
-            
-            # Remove duplicates by converting to set of JSON strings, then back
-            seen = set()
-            unique_clauses = []
-            for clause in clauses:
-                # Convert clause to JSON string for comparison
-                clause_str = str(sorted(clause.items())) if isinstance(clause, dict) else str(clause)
-                if clause_str not in seen:
-                    seen.add(clause_str)
-                    unique_clauses.append(clause)
-            
-            if len(unique_clauses) < len(clauses):
-                bool_query[clause_type] = unique_clauses
-                logger.info(f"Removed {len(clauses) - len(unique_clauses)} duplicate {clause_type} clauses")
+
+        def traverse(node: Any):
+            if not isinstance(node, dict):
+                return
+
+            aggs = node.get('aggs')
+            if isinstance(aggs, dict):
+                seen = {}
+                keys_to_remove = []
+                for name, agg in list(aggs.items()):
+                    if not isinstance(agg, dict):
+                        continue
+
+                    spec = None
+                    try:
+                        spec = json.dumps(agg, sort_keys=True, separators=(',', ':'))
+                    except TypeError:
+                        spec = str(agg)
+
+                    if spec in seen:
+                        keys_to_remove.append(name)
+                        logger.info(f"Removed duplicate aggregation '{name}' (same as '{seen[spec]}')")
+                    else:
+                        seen[spec] = name
+
+                    traverse(agg)
+
+                for key in keys_to_remove:
+                    aggs.pop(key, None)
+
+            for value in node.values():
+                traverse(value)
+
+        traverse(query_body)
     
     def _convert_module_name_terms_to_match(self, bool_query: Dict[str, Any]):
         """Convert term queries for module_name to match_phrase for fuzzy matching."""
@@ -5666,7 +6817,7 @@ class QueryOrchestrator:
         for agg in aggregations.values():
             count = self._extract_count_from_aggregation(agg)
             if count is not None:
-                return int(count)
+                return count
 
         return None
 
@@ -5675,8 +6826,10 @@ class QueryOrchestrator:
         if not isinstance(agg_value, dict):
             return None
 
-        if 'value' in agg_value and isinstance(agg_value['value'], (int, float)):
-            return int(agg_value['value'])
+        if 'value' in agg_value:
+            numeric_value = self._safe_int(agg_value.get('value'))
+            if numeric_value is not None:
+                return numeric_value
 
         # Check nested aggregations first (to find cardinality inside filters)
         for value in agg_value.values():
@@ -5686,7 +6839,9 @@ class QueryOrchestrator:
                     return nested
 
         if 'doc_count' in agg_value:
-            return int(agg_value['doc_count'])
+            numeric_doc = self._safe_int(agg_value.get('doc_count'))
+            if numeric_doc is not None:
+                return numeric_doc
 
         if 'buckets' in agg_value:
             # Not ideal for counts, skip buckets
@@ -5704,6 +6859,9 @@ class QueryOrchestrator:
         """
         if not query:
             return {'success': False, 'error': 'Empty query'}
+        
+        # Normalize envelope again just before execution (defensive)
+        self._normalize_query_envelope(query)
         
         # Final sanitization pass right before execution - catch anything that slipped through
         self._remove_terms_lookup_recursive(query)
@@ -5830,6 +6988,85 @@ class QueryOrchestrator:
                 result['aggregations'] = self._enhance_aggregations(result['aggregations'])
         
         return result
+    
+    def _apply_context_aware_labels(
+        self, 
+        execution_result: Dict[str, Any], 
+        user_message: str, 
+        query_payload: Dict[str, Any]
+    ) -> None:
+        """
+        Apply context-aware labels to aggregations based on what the user asked for.
+        
+        For example, when user asks "which modules completed", the chart should show
+        "Completions" as the metric label, not "Modules" or "By Module".
+        """
+        aggregations = execution_result.get('aggregations', {})
+        if not aggregations:
+            return
+        
+        message_lower = user_message.lower()
+        query_body = query_payload.get('query', {})
+        
+        # Detect if this is a completion query
+        is_completion_query = (
+            'complet' in message_lower or  # completed, completions, completion
+            self._query_has_completed_status_filter(query_body)
+        )
+        
+        # Detect if this is an assignment query
+        is_assignment_query = (
+            'assign' in message_lower and 'complet' not in message_lower
+        )
+        
+        # Apply context-aware labels to bucket aggregations
+        for agg_name, agg_data in aggregations.items():
+            if not isinstance(agg_data, dict) or 'buckets' not in agg_data:
+                continue
+            
+            # Determine the appropriate label based on context
+            # For "by_module" aggregations when asking about completions, use "Completions"
+            if is_completion_query:
+                if agg_name in ('by_module', 'modules', 'by_mid'):
+                    agg_data['_label'] = 'Completions'
+                    logger.info(f"Applied context-aware label 'Completions' to aggregation '{agg_name}'")
+                elif agg_name in ('by_user', 'by_email', 'users'):
+                    agg_data['_label'] = 'Completions'
+                    logger.info(f"Applied context-aware label 'Completions' to aggregation '{agg_name}'")
+                elif agg_name in ('by_city', 'cities'):
+                    agg_data['_label'] = 'Completions'
+                    logger.info(f"Applied context-aware label 'Completions' to aggregation '{agg_name}'")
+            elif is_assignment_query:
+                if agg_name in ('by_module', 'modules', 'by_mid'):
+                    agg_data['_label'] = 'Assignments'
+                    logger.info(f"Applied context-aware label 'Assignments' to aggregation '{agg_name}'")
+                elif agg_name in ('by_user', 'by_email', 'users'):
+                    agg_data['_label'] = 'Assignments'
+                    logger.info(f"Applied context-aware label 'Assignments' to aggregation '{agg_name}'")
+    
+    def _query_has_completed_status_filter(self, query_body: Dict[str, Any]) -> bool:
+        """Check if the query has a completed_status: 1 filter."""
+        if not query_body:
+            return False
+        
+        def check_filters(obj: Any) -> bool:
+            if isinstance(obj, dict):
+                # Check for term filter with completed_status: 1
+                if 'term' in obj:
+                    term_filter = obj['term']
+                    if isinstance(term_filter, dict) and term_filter.get('completed_status') == 1:
+                        return True
+                # Recursively check nested structures
+                for value in obj.values():
+                    if check_filters(value):
+                        return True
+            elif isinstance(obj, list):
+                for item in obj:
+                    if check_filters(item):
+                        return True
+            return False
+        
+        return check_filters(query_body)
     
     def _enhance_aggregations(self, aggregations: Dict[str, Any]) -> Dict[str, Any]:
         """Add human-readable labels to aggregation results and extract display names from sub-aggs."""
@@ -6114,11 +7351,13 @@ class QueryOrchestrator:
                             continue  # Skip normal processing for completion rate
                 
                 if 'value' in value:
-                    metrics[name] = {
-                        'label': label,
-                        'value': int(value['value']),
-                        'type': 'count'
-                    }
+                    numeric_value = self._safe_int(value.get('value'))
+                    if numeric_value is not None:
+                        metrics[name] = {
+                            'label': label,
+                            'value': numeric_value,
+                            'type': 'count'
+                        }
                 elif 'buckets' in value:
                     buckets = value['buckets']
                     # Handle both list and dict formats for buckets
@@ -6154,11 +7393,13 @@ class QueryOrchestrator:
                             'type': 'breakdown'
                         }
                 elif 'doc_count' in value:
-                    metrics[name] = {
-                        'label': label,
-                        'value': int(value['doc_count']),
-                        'type': 'count'
-                    }
+                    numeric_value = self._safe_int(value.get('doc_count'))
+                    if numeric_value is not None:
+                        metrics[name] = {
+                            'label': label,
+                            'value': numeric_value,
+                            'type': 'count'
+                        }
         
         return metrics
     
@@ -6195,23 +7436,33 @@ class QueryOrchestrator:
             return None
         
         completion_rate = all_bucket.get('completion_rate', {})
-        if not isinstance(completion_rate, dict) or 'value' not in completion_rate:
+        completion_rate_value = completion_rate.get('value') if isinstance(completion_rate, dict) else None
+        
+        def _get_numeric_value(agg: Any) -> Optional[float]:
+            if isinstance(agg, dict):
+                if isinstance(agg.get('value'), (int, float)):
+                    return float(agg['value'])
+                if isinstance(agg.get('doc_count'), (int, float)):
+                    return float(agg['doc_count'])
+            elif isinstance(agg, (int, float)):
+                return float(agg)
             return None
         
         # Extract values - check for both module completion rate (value_count on uid) and user completion rate (cardinality on mid)
-        rate_value = completion_rate.get('value', 0)
+        rate_value = completion_rate_value if completion_rate_value is not None else 0.0
         
         # Check if this is user completion rate FIRST (has assigned_modules.cardinality and completed.completed_modules.cardinality)
         # This is the pattern used by _force_user_completion_rate_query_structure
         assigned_modules = all_bucket.get('assigned_modules', {})
         completed = all_bucket.get('completed', {})
         
-        if isinstance(assigned_modules, dict) and 'value' in assigned_modules and isinstance(completed, dict):
+        if isinstance(assigned_modules, dict) and isinstance(completed, dict):
             completed_modules = completed.get('completed_modules', {})
-            if isinstance(completed_modules, dict) and 'value' in completed_modules:
-                # User completion rate structure
-                assigned_count = assigned_modules.get('value', 0)
-                completed_count = completed_modules.get('value', 0)
+            assigned_count = _get_numeric_value(assigned_modules)
+            completed_count = _get_numeric_value(completed_modules)
+            if assigned_count is not None and completed_count is not None:
+                if completion_rate_value is None:
+                    rate_value = (completed_count * 100.0 / assigned_count) if assigned_count > 0 else 0.0
                 
                 # Extract user name from query if available
                 user_name = None
@@ -6239,20 +7490,26 @@ class QueryOrchestrator:
                 
                 time_context = f" {time_period.description}" if time_period and not time_period.is_lifetime else ""
                 
+                # Ensure counts are integers (fallback to 0 if None)
+                completed_int = int(completed_count) if completed_count is not None else 0
+                assigned_int = int(assigned_count) if assigned_count is not None else 0
+                
                 if user_name:
-                    message = f"The completion rate for {user_name} is {rate_value:.1f}% ({int(completed_count)} modules completed out of {int(assigned_count)} modules assigned){time_context}."
+                    message = f"The completion rate for {user_name} is {rate_value:.1f}% ({completed_int} modules completed out of {assigned_int} modules assigned){time_context}."
                 else:
-                    message = f"The completion rate is {rate_value:.1f}% ({int(completed_count)} modules completed out of {int(assigned_count)} modules assigned){time_context}."
+                    message = f"The completion rate is {rate_value:.1f}% ({completed_int} modules completed out of {assigned_int} modules assigned){time_context}."
                 
                 return message
         
         # Check if this is module completion rate (has assigned.value_count and completed.completed_count.value_count)
         assigned = all_bucket.get('assigned', {})
-        if isinstance(assigned, dict) and 'value' in assigned:
-            # Module completion rate structure
-            assigned_count = assigned.get('value', 0)
+        if isinstance(assigned, dict):
+            assigned_count = _get_numeric_value(assigned)
             completed_count_agg = completed.get('completed_count', {}) if isinstance(completed, dict) else {}
-            completed_count = completed_count_agg.get('value', 0) if isinstance(completed_count_agg, dict) else 0
+            completed_count = _get_numeric_value(completed_count_agg)
+            if assigned_count is not None and completed_count is not None:
+                if completion_rate_value is None:
+                    rate_value = (completed_count * 100.0 / assigned_count) if assigned_count > 0 else 0.0
             
             # Extract module name from query if available
             module_name = None
@@ -6266,10 +7523,14 @@ class QueryOrchestrator:
             
             time_context = f" {time_period.description}" if time_period and not time_period.is_lifetime else ""
             
+            # Ensure counts are integers (fallback to 0 if None)
+            completed_int = int(completed_count) if completed_count is not None else 0
+            assigned_int = int(assigned_count) if assigned_count is not None else 0
+            
             if module_name:
-                message = f"The completion rate for {module_name} module is {rate_value:.1f}% ({int(completed_count)} completed out of {int(assigned_count)} assigned){time_context}."
+                message = f"The completion rate for {module_name} module is {rate_value:.1f}% ({completed_int} completed out of {assigned_int} assigned){time_context}."
             else:
-                message = f"The completion rate is {rate_value:.1f}% ({int(completed_count)} completed out of {int(assigned_count)} assigned){time_context}."
+                message = f"The completion rate is {rate_value:.1f}% ({completed_int} completed out of {assigned_int} assigned){time_context}."
             
             return message
         

@@ -46,8 +46,14 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
-# No database needed - we use OpenSearch
-DATABASES = {}
+# Minimal database config (app doesn’t use a relational DB, but Django requires an ENGINE)
+# Use a lightweight SQLite file so management commands (migrate, makemigrations) don’t fail.
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
 
 # Static files
 STATIC_URL = 'static/'
@@ -87,6 +93,8 @@ OPENSEARCH_INDEXES = {
     'module_catalog_data': os.getenv('LM_SUMMARY_DATA', 'converse_lm_summary_reports_prod'),
     # Monthly per-user activity summary (counts + points). Env var name per project: MONTHY_USER_ACTIVITY
     'monthly_user_activity_data': os.getenv('MONTHY_USER_ACTIVITY', 'monthly_user_activity_summary_prod'),
+    # Daily per-user activity summary (counts + points). Env var name per project: DAILY_USER_ACTIVITY
+    'daily_user_activity_data': os.getenv('DAILY_USER_ACTIVITY', 'daily_user_activity_summary_prod'),
 }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

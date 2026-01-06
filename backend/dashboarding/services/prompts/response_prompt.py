@@ -195,6 +195,35 @@ EXAMPLE FORMAT:
 "Skill distribution: Technical skills dominate at 45% (567 records), followed by Sales at 30% (378) and Soft Skills at 25% (312)."
 """,
     }
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        """Best-effort conversion to int without raising TypeError."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return int(float(stripped))
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _format_count_plain(cls, value: Any) -> Optional[str]:
+        numeric = cls._safe_int(value)
+        return str(numeric) if numeric is not None else None
+
+    @classmethod
+    def _format_count_commas(cls, value: Any) -> Optional[str]:
+        numeric = cls._safe_int(value)
+        return f"{numeric:,}" if numeric is not None else None
     
     @classmethod
     def build_prompt(
@@ -298,7 +327,12 @@ EXAMPLE FORMAT:
         if isinstance(value, dict):
             # Cardinality or value count
             if 'value' in value:
-                return f"{name}: {int(value['value']):,}"
+                formatted_value = cls._format_count_commas(value.get('value'))
+                if formatted_value is None:
+                    raw_value = value.get('value')
+                    fallback = raw_value if raw_value is not None else 'N/A'
+                    return f"{name}: {fallback}"
+                return f"{name}: {formatted_value}"
             
             # Terms aggregation (buckets) or Date histogram (buckets)
             if 'buckets' in value:
@@ -351,7 +385,12 @@ EXAMPLE FORMAT:
                             completed_count = completed_count_agg.get('value', 0) if isinstance(completed_count_agg, dict) else 0
                             
                             # Return formatted completion rate - this is what the LLM will see
-                            formatted = f"{name}: {rate_value:.1f}% completion rate ({int(completed_count)} completed out of {int(assigned_count)} assigned)"
+                            completed_display = cls._format_count_plain(completed_count) or 'N/A'
+                            assigned_display = cls._format_count_plain(assigned_count) or 'N/A'
+                            formatted = (
+                                f"{name}: {rate_value:.1f}% completion rate "
+                                f"({completed_display} completed out of {assigned_display} assigned)"
+                            )
                             return formatted
                 
                 # Check if this is a date histogram (has key_as_string or date-like keys)
@@ -385,7 +424,8 @@ EXAMPLE FORMAT:
                         count = b.get('doc_count', 0)
                         
                         if count > 0:
-                            bucket_strs.append(f"{key} ({int(count)})")
+                            count_display = cls._format_count_plain(count) or '0'
+                            bucket_strs.append(f"{key} ({count_display})")
                     
                     result = f"{name}: {bucket_count} days total"
                     if bucket_strs:
@@ -430,7 +470,8 @@ EXAMPLE FORMAT:
                         if '@' in str(key) and not user_details_found:
                             key = str(key)  # Keep email as-is
                         
-                        bucket_strs.append(f"{key}: {int(count):,}")
+                        count_display = cls._format_count_commas(count) or 'N/A'
+                        bucket_strs.append(f"{key}: {count_display}")
                     
                     result = f"{name}: {bucket_count} categories"
                     if bucket_strs:

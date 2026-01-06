@@ -48,8 +48,40 @@ CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
    - ALWAYS add: {"term": {"status": 5}} and {"term": {"cmid": 1}} ← Active users in this tenant only!
    - Use completed_on (epoch) for month/time filters and monthly trends
    - Metrics are MONTHLY counts/points fields: module, instant_answers, learning_pathway, lotd, points (NOT module names)
-   - Unique users field is "id" (NOT uid) in this index
+  - Unique users field is "uid" (NOT id) in this index
    - DO NOT use completed_status/assigned_status/module_name/mid (this index is NOT event-level)
+   
+  FOR DAILY USER ACTIVITY INDEX (daily_user_activity_data):
+   - ALWAYS add: {"term": {"status": 5}} and {"term": {"cmid": 1}} ← Active users in this tenant only!
+   - Use completed_on (epoch) for day/time filters and daily trends (fixed_interval "1d" date_histogram)
+  - Metrics are DAILY counts/points fields: module, instant_answers, learning_pathway, lotd, points
+  - Unique users field is "uid" (NOT id) in this index
+   - DO NOT use module_status/assigned_status/completed_status/module_name/mid/ratings (this index is NOT event-level and has no module identifiers)
+   - Single-user questions like "how many instant answers has <user> asked (today/last week/etc.)" MUST use this index with a sum aggregation on the requested metric.
+
+🔴 ENGAGEMENT METRIC ROUTING (OVERRIDES COMPLETION KEYWORDS):
+  - If the user explicitly mentions the metric fields module, instant_answers, learning_pathway, lotd, or points, treat it as an ACTIVITY-SUM query.
+  - Use the DAILY or MONTHLY activity index based on the timeframe, even if the user says words like "completed" or "completion".
+  - ONLY use module_consumption_data when the user asks about module names, completion status per module, or completion rate math.
+  - For these metric questions, ALWAYS build KPI-style aggregation queries:
+      • Set "size": 0 (no hits)
+      • Add { "sum": { "field": "<metric>" } } (named clearly, e.g., "learning_pathway_total")
+      • Do NOT return raw hits or tables unless the user explicitly asks for "rows" / "list" / "show records".
+      • If a single UID/email/name filter is present, still keep size:0 + sum aggregation (no rows).
+
+🔴 PERSON NAME FILTERING (for ANY index when identifying a human):
+   - Always use a bool.should with first_name and last_name matches (minimum_should_match = 1).
+   - Example:
+     {
+       "bool": {
+         "should": [
+           {"match": {"first_name": {"query": "tanuj", "fuzziness": "AUTO"}}},
+           {"match": {"last_name": {"query": "tanuj", "fuzziness": "AUTO"}}}
+         ],
+         "minimum_should_match": 1
+       }
+     }
+   - NEVER require both first_name AND last_name simultaneously; matching either field should include the user.
    
    This applies to queries about:
    - Completions (consumption index only)
@@ -78,8 +110,8 @@ CRITICAL RULES - MUST FOLLOW IN EVERY QUERY
    CORRECT: {"cardinality": {"field": "uid"}}
    WRONG:   {"cardinality": {"field": "email_addr"}}
    
-   ⚠️ MONTHLY ACTIVITY INDEX EXCEPTION:
-   - Unique users in monthly_user_activity_data use: {"cardinality": {"field": "id"}} (NOT uid)
+   ⚠️ MONTHLY/DAILY ACTIVITY INDEX RULE:
+   - Unique users in monthly_user_activity_data / daily_user_activity_data use: {"cardinality": {"field": "uid"}} (NOT id)
    
    CORRECT: {"cardinality": {"field": "mid"}}
    WRONG:   {"cardinality": {"field": "module_name"}}
@@ -271,14 +303,15 @@ CARDINALITY RULES (Which Field to Use for Unique Counts)
   I2) Completion rate for a single user (uid/email/name)
       - CRITICAL: To find the user, determine if input is email or name:
         * If input contains "@" → it's an EMAIL → use {{"match": {{"email_addr": {{"query": "value"}}}}}}
-        * If input is 2+ words (e.g., "tanuj sadasivam") → it's a FULL NAME → use:
+        * If input is 2+ words (e.g., "tanuj sadasivam") → treat as FULL NAME but still match either field:
           {{"bool": {{
-            "must": [
+            "should": [
               {{"match": {{"first_name": {{"query": "first_word", "operator": "and"}}}}}},
               {{"match": {{"last_name": {{"query": "remaining_words", "operator": "and"}}}}}}
-            ]
+            ],
+            "minimum_should_match": 1
           }}}}
-        * If input is 1 word (e.g., "tanuj") → it's a SINGLE NAME → use:
+        * If input is 1 word (e.g., "tanuj") → it's a SINGLE NAME → same OR pattern:
           {{"bool": {{
             "should": [
               {{"match": {{"first_name": {{"query": "value", "fuzziness": "AUTO"}}}}}},
@@ -556,6 +589,7 @@ You MUST choose the correct index based on what the user is asking about. WRONG 
    - "Module catalog" / "list all modules" → Use CATALOG index!
    - "Module metadata" / "module types" → Use CATALOG index!
    - Pure user directory (no module/completion context) → Use USER PROFILE index!
+   - Aggregated engagement metrics (module / instant_answers / learning_pathway / lotd / points counts) → Use DAILY or MONTHLY activity indexes instead!
    
    🔴 FIELD NAMES: Uses "module_status" (NOT "status") and "user_status" (NOT "status")
    🔴 DOES NOT HAVE: "status" field (only has "module_status" and "user_status")
@@ -614,25 +648,48 @@ You MUST choose the correct index based on what the user is asking about. WRONG 
    🔴 FIELD NAMES:
    - User status: "status" (NOT user_status)
    - Activity month anchor: "completed_on" (epoch)
-   - Unique user id: "id" (NOT uid)
-   - Tenant scope: ALWAYS filter {"term": {"cmid": 1}}
+   - Unique user id: "uid" (NOT id)
+   - Tenant scope: ALWAYS filter {{"term": {{"cmid": 1}}}}
    - Metrics (MONTHLY COUNTS): module, instant_answers, learning_pathway, lotd, points
    
-   🔴 DOES NOT HAVE: module_status, user_status, assigned_status, completed_status, module_name, mid, ratings
+    🔴 DOES NOT HAVE: module_status, user_status, assigned_status, completed_status, module_name, mid, ratings
+
+5. DAILY USER ACTIVITY INDEX (index_id: "daily_user_activity_data" - maps to DAILY_USER_ACTIVITY env var):
+   ✅ USE FOR:
+   - Day-level totals (e.g., "module completions yesterday", "points earned on Jan 2")
+   - Daily engagement metrics: module, instant_answers, learning_pathway, lotd, points
+   - Daily leaderboards/lists (e.g., "top users by points today", "users with zero instant answers yesterday")
+   - Daily breakdowns/segmentation (e.g., "points by city yesterday", "module completions by designation last 7 days")
+   - Daily trends for short windows (e.g., "daily module completions trend for last 30 days")
+   - Single-user "how many [metric] has <user> done/earned?" queries when no module/course detail is requested. Default to this index (even for "all time" unless user explicitly asks for monthly totals), sum the requested metric, and filter by the provided timeframe (today/yesterday/last 7 days/etc.).
+   
+   ❌ DO NOT USE FOR:
+   - Module-level breakdowns ("which modules") or completion rate math → Use CONSUMPTION index
+   - Monthly summaries → Use MONTHLY USER ACTIVITY index
+   
+   🔴 FIELD NAMES:
+   - User status: "status" (NOT user_status)
+   - Activity day anchor: "completed_on" (epoch, start/end of day)
+   - Unique user id: "uid" (NOT id)
+   - Tenant scope: ALWAYS filter {{"term": {{"cmid": 1}}}}
+   - Metrics (DAILY COUNTS): module, instant_answers, learning_pathway, lotd, points (use total_points for cumulative totals when requested)
+   
+   🔴 DOES NOT HAVE: module_status, assigned_status, completed_status, module_name, mid, ratings, completion_date fields
 
 🔴🔴🔴 DECISION TREE - USE THIS TO CHOOSE THE INDEX:
 1. Does the question ask for USER PROFILE INFORMATION (name, email, location, designation, hired_on, user_role, etc.) WITHOUT mentioning modules/completions?
    Examples: "info on [user]", "give me info on tanuj", "user details", "find user by email", "list users", "show me user profile"
    → YES → Use USER PROFILE index (user_profile_data) ← CHECK THIS FIRST FOR USER QUERIES!
 
-2. Does the question ask for MONTHLY ACTIVITY / ENGAGEMENT METRICS (module counts, instant answers, learning pathway, LOTD, points), monthly totals, monthly trends, or monthly leaderboards?
-   Examples: "total points last month", "monthly module completions trend for 2025", "instant answers in Nov 2025", "top users by points last month"
-   → YES → Use MONTHLY USER ACTIVITY index (monthly_user_activity_data)
-   
+2. Does the question ask for engagement metrics (module / instant_answers / learning_pathway / lotd / points) WITHOUT module names or completion-status fields?
+   → YES → Pick activity index based on timeframe:
+      • Day-level / relative ("today", "yesterday", "last 7 days", "this week", "all time" with no explicit month) → DAILY USER ACTIVITY (daily_user_activity_data)
+      • Month-level ("Nov 2025", "last month", "monthly trend", "in 2025") → MONTHLY USER ACTIVITY (monthly_user_activity_data)
+
 3. Does the question mention "published" / "publishing" / "publish date"?
    → YES → Use CATALOG index (module_catalog_data)
    
-4. Does the question mention EVENT-LEVEL "completed" / "completion rate" / "assigned" / "ratings" / "which modules did user complete"?
+4. Does the question mention EVENT-LEVEL "completed" / "completion rate" / "assigned" / "ratings" / "which modules did user complete" (and NOT the engagement metrics above)?
    → YES → Use CONSUMPTION index (module_consumption_data)
    
 5. Does the question mention BOTH user info AND module activity/completion?
@@ -673,6 +730,7 @@ Return a JSON object with this EXACT structure:
 - For CATALOG index (LM_SUMMARY_DATA env var): "module_catalog_data"  
 - For USER PROFILE index (LEARNBEE_MODULE_REPORTS_DATA env var): "user_profile_data"
 - For MONTHLY USER ACTIVITY index (MONTHY_USER_ACTIVITY env var): "monthly_user_activity_data"
+- For DAILY USER ACTIVITY index (DAILY_USER_ACTIVITY env var): "daily_user_activity_data"
 
 🔴 CRITICAL: SINGLE INDEX ONLY
 - ALWAYS specify a SINGLE index_id as a string using the exact values above

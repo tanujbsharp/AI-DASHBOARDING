@@ -1,7 +1,7 @@
 import { Component, OnInit, inject, EventEmitter, Output } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ApiService, FieldInfo, IndexSchema } from '../../services/api.service';
+import { ApiService, FieldInfo, IndexSchema, ReportPlanResponse } from '../../services/api.service';
 
 interface Filter {
   id: string;
@@ -39,6 +39,90 @@ interface MegaFilter {
         </button>
       </div>
 
+      <div class="intent-panel">
+        <div class="intent-header">
+          <div>
+            <h3>Describe your report</h3>
+            <p>We’ll analyze your intent, pick the best index, and preload relevant fields.</p>
+          </div>
+          <div class="intent-actions">
+            @if (planResult) {
+              <button class="btn secondary" (click)="clearPlan()">Clear Selection</button>
+            }
+            <button 
+              class="btn primary" 
+              (click)="analyzeIntent()" 
+              [disabled]="isAnalyzingIntent"
+            >
+              @if (isAnalyzingIntent) {
+                <span class="spinner sm"></span>
+                Analyzing...
+              } @else {
+                {{ planResult ? 'Re-run Analysis' : 'Analyze Intent' }}
+              }
+            </button>
+            @if (planResult && selectedColumns.length > 0) {
+              <button 
+                class="btn success" 
+                (click)="generateReport()" 
+                [disabled]="isLoading"
+              >
+                @if (isLoading) {
+                  <span class="spinner sm"></span>
+                  Generating...
+                } @else {
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="5 3 19 12 5 21 5 3"/>
+                  </svg>
+                  Generate Report
+                }
+              </button>
+            }
+          </div>
+        </div>
+        <textarea 
+          [(ngModel)]="reportIntent" 
+          placeholder="e.g., Which users completed situational leadership last quarter? or Show instant answer usage by city last month."
+        ></textarea>
+        @if (planResult) {
+          <div class="intent-status animate-fade-in">
+            <div class="intent-summary">
+              <span class="chip chip-accent">Index: {{ selectedIndexLabel }}</span>
+              <span class="chip">Confidence: {{ planResult.confidence | number:'1.0-2' }}</span>
+            </div>
+            <div class="intent-reasons">
+              @for (reason of planResult.reasons; track reason) {
+                <span>{{ reason }}</span>
+              }
+            </div>
+            @if (planResult.recommended_fields?.length) {
+              <div class="intent-fields">
+                <span>Recommended fields:</span>
+                <div class="field-chips">
+                  @for (field of planResult.recommended_fields; track field) {
+                    <span class="chip">{{ formatFieldName(field) }}</span>
+                  }
+                </div>
+              </div>
+            }
+          </div>
+        }
+        @if (intentError) {
+          <div class="intent-error">{{ intentError }}</div>
+        }
+      </div>
+
+      @if (!canConfigureReport) {
+        <div class="builder-placeholder">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <line x1="3" y1="9" x2="21" y2="9"/>
+            <line x1="9" y1="21" x2="9" y2="9"/>
+          </svg>
+          <h3>Describe your report first</h3>
+          <p>Enter a natural-language prompt above and click <strong>Analyze Intent</strong>. We’ll pick the right index and load the relevant fields automatically.</p>
+        </div>
+      } @else {
       <div class="playground-content">
         <!-- Left Panel: Field Selector -->
         <div class="panel fields-panel">
@@ -46,46 +130,52 @@ interface MegaFilter {
             <h3>Available Fields</h3>
             <span class="field-count">{{ availableFields.length }} fields</span>
           </div>
-          <div class="search-box">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
-            </svg>
-            <input type="text" [(ngModel)]="fieldSearch" placeholder="Search fields...">
-          </div>
-          <div class="fields-list">
-            @for (field of filteredAvailableFields; track field.name) {
-              <div 
-                class="field-item" 
-                [class.selected]="isFieldSelected(field.name)"
-                (click)="toggleField(field)"
-                [title]="getFieldTooltip(field)"
-              >
-                <div class="field-info">
-                  <span class="field-name">{{ formatFieldName(field.name) }}</span>
-                  <span class="field-type">{{ field.type }}</span>
+          @if (!canConfigureReport) {
+            <div class="empty-panel">
+              <p>Enter a prompt and run Analyze Intent to load the available fields.</p>
+            </div>
+          } @else {
+            <div class="search-box">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+              <input type="text" [(ngModel)]="fieldSearch" placeholder="Search fields...">
+            </div>
+            <div class="fields-list limited">
+              @for (field of filteredAvailableFields; track field.name) {
+                <div 
+                  class="field-item" 
+                  [class.selected]="isFieldSelected(field.name)"
+                  (click)="toggleField(field)"
+                  [title]="getFieldTooltip(field)"
+                >
+                  <div class="field-info">
+                    <span class="field-name">{{ formatFieldName(field.name) }}</span>
+                    <span class="field-type">{{ field.type }}</span>
+                  </div>
+                  <div class="field-badges">
+                    @if (field.filterable) {
+                      <span class="badge filter">filter</span>
+                    }
+                    @if (field.sortable) {
+                      <span class="badge sort">sort</span>
+                    }
+                  </div>
+                  <div class="field-action">
+                    @if (isFieldSelected(field.name)) {
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                      </svg>
+                    } @else {
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                      </svg>
+                    }
+                  </div>
                 </div>
-                <div class="field-badges">
-                  @if (field.filterable) {
-                    <span class="badge filter">filter</span>
-                  }
-                  @if (field.sortable) {
-                    <span class="badge sort">sort</span>
-                  }
-                </div>
-                <div class="field-action">
-                  @if (isFieldSelected(field.name)) {
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
-                    </svg>
-                  } @else {
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-                    </svg>
-                  }
-                </div>
-              </div>
-            }
-          </div>
+              }
+            </div>
+          }
         </div>
 
         <!-- Middle Panel: Selected Columns & Filters -->
@@ -97,7 +187,11 @@ interface MegaFilter {
               <span class="count">{{ selectedColumns.length }}</span>
             </div>
             <div class="selected-columns">
-              @if (selectedColumns.length === 0) {
+              @if (!canConfigureReport) {
+                <div class="empty-state">
+                  <p>Analyze your intent to load fields and start selecting columns.</p>
+                </div>
+              } @else if (selectedColumns.length === 0) {
                 <div class="empty-state">
                   <p>Click fields from the left panel to add columns</p>
                 </div>
@@ -159,7 +253,7 @@ interface MegaFilter {
           <div class="section">
             <div class="section-header">
               <h3>Additional Filters</h3>
-              <button class="add-btn" (click)="addFilter()">
+              <button class="add-btn" (click)="addFilter()" [disabled]="!canConfigureReport">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
                 </svg>
@@ -228,7 +322,24 @@ interface MegaFilter {
         </div>
 
         <!-- Right Panel: Preview & Execute -->
-        <div class="panel preview-panel">
+        <div class="panel preview-panel with-controls">
+          @if (planResult) {
+            <div class="section">
+              <div class="section-header">
+                <h3>Data Source</h3>
+              </div>
+              <div class="data-source-card">
+                <div>
+                  <div class="data-source-name">{{ selectedIndexLabel }}</div>
+                  <div class="data-source-meta">Index ID: {{ planResult.index_id }}</div>
+                </div>
+                <div class="data-source-confidence">
+                  <span>Confidence</span>
+                  <strong>{{ planResult.confidence | number:'1.0-2' }}</strong>
+                </div>
+              </div>
+            </div>
+          }
           <div class="section">
             <div class="section-header">
               <h3>Generated Prompt</h3>
@@ -250,28 +361,14 @@ interface MegaFilter {
             >
           </div>
 
-          <div class="action-buttons">
+          <div class="preview-controls">
             <button class="btn secondary" (click)="resetAll()">
               Reset All
-            </button>
-            <button 
-              class="btn primary" 
-              [disabled]="selectedColumns.length === 0 || isLoading"
-              (click)="generateReport()"
-            >
-              @if (isLoading) {
-                <span class="spinner"></span>
-                Generating...
-              } @else {
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polygon points="5 3 19 12 5 21 5 3"/>
-                </svg>
-                Generate Report
-              }
             </button>
           </div>
         </div>
       </div>
+      }
     </div>
   `,
   styles: [`
@@ -328,6 +425,144 @@ interface MegaFilter {
       overflow: hidden;
     }
 
+    .intent-panel {
+      padding: var(--spacing-lg);
+      background: white;
+      border-bottom: 1px solid var(--border-primary);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+
+    .intent-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-md);
+      
+      h3 { margin: 0; font-size: 1rem; font-weight: 600; color: var(--text-primary); }
+      p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 0.85rem; }
+    }
+
+    .intent-actions {
+      display: flex;
+      gap: var(--spacing-sm);
+      flex-wrap: wrap;
+    }
+
+    .intent-panel textarea {
+      width: 100%;
+      min-height: 90px;
+      border: 1px solid var(--border-primary);
+      border-radius: var(--radius-md);
+      padding: var(--spacing-md);
+      font-size: 0.9rem;
+      resize: vertical;
+    }
+
+    .intent-status {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+      padding: var(--spacing-md);
+      background: var(--bg-tertiary);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-primary);
+    }
+
+    .intent-summary {
+      display: flex;
+      gap: var(--spacing-sm);
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .intent-reasons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-xs);
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+
+    .intent-fields {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-xs);
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+
+    .field-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+
+    .chip-accent {
+      background: rgba(8, 145, 178, 0.1);
+      color: var(--accent-primary);
+    }
+
+    .intent-error {
+      color: var(--accent-danger);
+      font-size: 0.85rem;
+    }
+
+    .builder-placeholder {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: var(--spacing-2xl);
+      gap: var(--spacing-md);
+      color: var(--text-secondary);
+    }
+
+    .builder-placeholder svg {
+      color: var(--text-tertiary);
+    }
+
+    .builder-placeholder h3 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: var(--text-primary);
+    }
+
+    .builder-placeholder p {
+      max-width: 480px;
+      margin: 0;
+      color: var(--text-secondary);
+      font-size: 0.95rem;
+    }
+
+    .empty-panel {
+      padding: var(--spacing-lg);
+      text-align: center;
+      color: var(--text-tertiary);
+      font-size: 0.85rem;
+    }
+
+    .spinner.sm {
+      width: 14px;
+      height: 14px;
+      border-width: 2px;
+    }
+
     .panel {
       background: white;
       display: flex;
@@ -369,6 +604,10 @@ interface MegaFilter {
       flex: 1;
       overflow-y: auto;
       padding: var(--spacing-sm);
+    }
+
+    .fields-list.limited {
+      max-height: 520px;
     }
 
     .field-item {
@@ -620,6 +859,55 @@ interface MegaFilter {
       overflow-y: auto;
     }
 
+    .preview-panel.with-controls {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .preview-controls {
+      padding: var(--spacing-md);
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .data-source-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: var(--spacing-md);
+      border: 1px solid var(--border-primary);
+      border-radius: var(--radius-md);
+      background: white;
+    }
+
+    .data-source-name {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 360px;
+    }
+
+    .data-source-meta {
+      font-size: 0.8rem;
+      color: var(--text-tertiary);
+      margin-top: 2px;
+    }
+
+    .data-source-confidence {
+      text-align: right;
+      font-size: 0.75rem;
+      color: var(--text-tertiary);
+      
+      strong {
+        display: block;
+        font-size: 1.25rem;
+        color: var(--text-primary);
+      }
+    }
+
     .prompt-preview {
       background: var(--bg-secondary);
       border: 1px solid var(--border-primary);
@@ -683,6 +971,15 @@ interface MegaFilter {
         &:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(8,145,178,0.3); }
         &:disabled { opacity: 0.6; cursor: not-allowed; }
       }
+
+      &.success {
+        background: #16a34a;
+        border: none;
+        color: white;
+        
+        &:hover:not(:disabled) { background: #15803d; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.3); }
+        &:disabled { opacity: 0.6; cursor: not-allowed; }
+      }
     }
 
     .spinner {
@@ -705,8 +1002,11 @@ export class PromptPlaygroundComponent implements OnInit {
 
   // Schema
   schema: IndexSchema | null = null;
+  planResult: ReportPlanResponse | null = null;
   availableFields: FieldInfo[] = [];
   fieldSearch = '';
+  intentError = '';
+  isAnalyzingIntent = false;
 
   // Selected columns
   selectedColumns: string[] = [];
@@ -728,21 +1028,99 @@ export class PromptPlaygroundComponent implements OnInit {
   sortOrder: 'asc' | 'desc' = 'desc';
 
   // Report
+  reportIntent = '';
   reportTitle = '';
   isLoading = false;
 
   ngOnInit() {
-    this.loadSchema();
+    // Ensure every session starts clean; fields are loaded only after planning.
+    this.clearPlan();
   }
 
-  loadSchema() {
-    this.api.getSchema('module_consumption_data').subscribe({
-      next: (schema) => {
-        this.schema = schema;
-        this.availableFields = schema.fields;
+  analyzeIntent() {
+    const trimmedIntent = this.reportIntent.trim();
+    if (!trimmedIntent) {
+      this.intentError = 'Describe the report you want so we can pick a data source.';
+      return;
+    }
+
+    this.isAnalyzingIntent = true;
+    this.intentError = '';
+
+    this.api.planReport(trimmedIntent).subscribe({
+      next: (plan) => {
+        this.isAnalyzingIntent = false;
+        this.applyPlan(plan);
       },
-      error: (err) => console.error('Failed to load schema:', err)
+      error: (err) => {
+        this.isAnalyzingIntent = false;
+        this.intentError = err.error?.error || 'Failed to analyze the intent. Please try again.';
+      }
     });
+  }
+
+  clearPlan() {
+    this.planResult = null;
+    this.schema = null;
+    this.availableFields = [];
+    this.selectedColumns = [];
+    this.selectedMegaFilter = '';
+    this.customMegaFilter = '';
+    this.filters = [];
+    this.sortField = '';
+    this.sortOrder = 'desc';
+    this.intentError = '';
+  }
+
+  private applyPlan(plan: ReportPlanResponse) {
+    this.planResult = plan;
+    this.schema = plan.schema || null;
+    this.availableFields = plan.schema?.fields || [];
+    this.restoreRecommendedColumns();
+    this.selectedMegaFilter = '';
+    this.customMegaFilter = '';
+    this.filters = [];
+    this.sortField = '';
+    this.sortOrder = 'desc';
+  }
+
+  private restoreRecommendedColumns() {
+    if (!this.planResult) {
+      this.selectedColumns = [];
+      return;
+    }
+
+    const schemaFields = new Set(this.availableFields.map((field) => field.name));
+    const recommended = this.planResult.recommended_fields || [];
+    const filtered = recommended.filter((field) => schemaFields.has(field));
+    if (filtered.length) {
+      this.selectedColumns = [...filtered];
+      return;
+    }
+
+    if (this.availableFields.length) {
+      this.selectedColumns = this.availableFields.slice(0, Math.min(6, this.availableFields.length)).map((field) => field.name);
+    } else {
+      this.selectedColumns = [];
+    }
+  }
+
+  get canConfigureReport(): boolean {
+    return !!(this.planResult && this.availableFields.length);
+  }
+
+  get selectedIndexLabel(): string {
+    if (!this.planResult) return 'No data source selected';
+    return this.planResult.index_name || this.formatIndexDisplay(this.planResult.index_id);
+  }
+
+  formatIndexDisplay(value: string | undefined): string {
+    if (!value) return '';
+    return value
+      .replace(/_/g, ' ')
+      .split(' ')
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
   }
 
   get filteredAvailableFields(): FieldInfo[] {
@@ -765,14 +1143,23 @@ export class PromptPlaygroundComponent implements OnInit {
   get generatedPrompt(): string {
     let parts: string[] = [];
 
+    const intro: string[] = [];
+    if (this.reportIntent.trim()) {
+      intro.push(`Goal: ${this.reportIntent.trim()}`);
+    } else {
+      intro.push('Goal: Create a table report');
+    }
+    if (this.planResult) {
+      intro.push(`Data source: ${this.selectedIndexLabel} (${this.planResult.index_id}).`);
+    }
+    parts.push(intro.join('\n'));
+
     // Mega filter
     if (this.selectedMegaFilter) {
       const mf = this.megaFilters.find(m => m.id === this.selectedMegaFilter);
-      if (mf) parts.push(`Show ${mf.label.toLowerCase()}`);
+      if (mf) parts.push(`\nFocus: ${mf.label}`);
     } else if (this.customMegaFilter) {
-      parts.push(`Show ${this.customMegaFilter}`);
-    } else {
-      parts.push('Create a table report');
+      parts.push(`\nFocus: ${this.customMegaFilter}`);
     }
 
     // Additional filters
@@ -852,6 +1239,7 @@ export class PromptPlaygroundComponent implements OnInit {
   }
 
   addFilter() {
+    if (!this.canConfigureReport) return;
     this.filters.push({
       id: Date.now().toString(),
       field: '',
@@ -870,7 +1258,11 @@ export class PromptPlaygroundComponent implements OnInit {
   }
 
   resetAll() {
-    this.selectedColumns = [];
+    if (this.planResult) {
+      this.restoreRecommendedColumns();
+    } else {
+      this.selectedColumns = [];
+    }
     this.selectedMegaFilter = '';
     this.customMegaFilter = '';
     this.filters = [];

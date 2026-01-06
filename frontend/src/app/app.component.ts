@@ -309,7 +309,7 @@ interface DashboardWidgetPayload {
                       @if (shouldShowQuery(msg)) {
                         <pre class="query-code">{{ getQueryJson(msg) }}</pre>
                       }
-                    } @else if (msg.response?.query_result?.aggregations && (msg.response?.response_type === 'bar_chart' || msg.response?.response_type === 'pie_chart' || msg.response?.response_type === 'line_chart' || !(msg.response?.query_result?.results?.length))) {
+                    } @else if (msg.response?.query_result?.aggregations && (msg.response?.response_type === 'bar_chart' || msg.response?.response_type === 'pie_chart' || msg.response?.response_type === 'line_chart' || (!(msg.response?.query_result?.results?.length) && msg.response?.response_type !== 'kpi_widget'))) {
                       <!-- Aggregation results with optional chart -->
                       <div class="aggregation-results">
                         @if (getChartData(msg.response?.visualization, msg.response?.query_result?.aggregations, msg.response?.title); as chartData) {
@@ -343,6 +343,38 @@ interface DashboardWidgetPayload {
                                 @if (agg.description) {
                                   <div class="agg-description">{{ agg.description }}</div>
                                 }
+                              }
+                            </div>
+                          }
+                        </div>
+                        <button class="action-btn" (click)="toggleQuery(msg)" style="margin-top: 12px;">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+                          </svg>
+                          {{ msg.showQuery ? 'Hide' : 'Show' }} Query
+                        </button>
+                        @if (canAddToDashboard(msg)) {
+                          <button class="action-btn icon-only add-to-dashboard-inline" (click)="openAddToDashboard(msg)" title="Add to dashboard">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                              <line x1="12" y1="5" x2="12" y2="19"/>
+                              <line x1="5" y1="12" x2="19" y2="12"/>
+                            </svg>
+                          </button>
+                        }
+                        @if (shouldShowQuery(msg)) {
+                          <pre class="query-code">{{ getQueryJson(msg) }}</pre>
+                        }
+                      </div>
+                    } @else if (msg.response?.response_type === 'kpi_widget' && msg.response?.query_result?.aggregations) {
+                      <!-- KPI Widget display -->
+                      <div class="kpi-widget-results">
+                        <div class="kpi-cards-container">
+                          @for (agg of getAggregations(msg.response?.query_result?.aggregations); track agg.name) {
+                            <div class="kpi-card">
+                              <div class="kpi-card-value">{{ agg.value }}</div>
+                              <div class="kpi-card-label">{{ agg.name }}</div>
+                              @if (agg.description) {
+                                <div class="kpi-card-description">{{ agg.description }}</div>
                               }
                             </div>
                           }
@@ -604,15 +636,16 @@ interface DashboardWidgetPayload {
       background: rgba(0, 0, 0, 0.5);
       z-index: 1000;
       display: flex;
+      flex-direction: column;
       align-items: center;
-      justify-content: center;
+      overflow-y: auto;
       padding: var(--spacing-xl);
       animation: fadeIn 0.2s ease;
       
       app-prompt-playground {
         width: 100%;
         max-width: 1400px;
-        height: 90vh;
+        margin: var(--spacing-xl) 0;
         animation: slideUp 0.3s ease;
       }
     }
@@ -1384,6 +1417,50 @@ interface DashboardWidgetPayload {
       color: var(--text-primary);
     }
     
+    /* KPI Widget Results */
+    .kpi-widget-results {
+      margin-top: var(--spacing-md);
+    }
+    
+    .kpi-cards-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-lg);
+      justify-content: center;
+    }
+    
+    .kpi-card {
+      background: linear-gradient(135deg, rgba(8, 145, 178, 0.12), rgba(124, 58, 237, 0.08));
+      border: 1px solid rgba(8, 145, 178, 0.25);
+      border-radius: var(--radius-xl);
+      padding: var(--spacing-xl) var(--spacing-2xl);
+      text-align: center;
+      min-width: 180px;
+      box-shadow: 0 4px 12px rgba(8, 145, 178, 0.1);
+    }
+    
+    .kpi-card-value {
+      font-size: 2.5rem;
+      font-weight: 700;
+      color: var(--accent-primary);
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+    
+    .kpi-card-label {
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-top: var(--spacing-sm);
+      text-transform: capitalize;
+    }
+    
+    .kpi-card-description {
+      font-size: 0.75rem;
+      color: var(--text-tertiary);
+      margin-top: var(--spacing-xs);
+    }
+    
     .message-time {
       font-size: 0.6875rem;
       color: var(--text-tertiary);
@@ -1889,6 +1966,42 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
         } else if ('unique_completed' in data && typeof data.unique_completed === 'object') {
           // Another nested pattern
           value = this.formatNumber(data.unique_completed.value);
+        } else if ('buckets' in data && data.buckets && typeof data.buckets === 'object' && !Array.isArray(data.buckets)) {
+          // Filters aggregation buckets (dict format) - common for completion rate KPIs (scope.buckets.all...)
+          const bucketsObj = data.buckets as Record<string, any>;
+                const firstBucket = bucketsObj['all'] || Object.values(bucketsObj)[0];
+          if (firstBucket && typeof firstBucket === 'object') {
+            const completionRate = (firstBucket as any).completion_rate;
+            if (completionRate && typeof completionRate === 'object' && 'value' in completionRate) {
+              const rate = (completionRate as any).value;
+              value = typeof rate === 'number' ? `${rate.toFixed(1)}%` : String(rate);
+              // Helpful context chips if available
+              const assigned =
+                (firstBucket as any).assigned_modules?.value ??
+                (firstBucket as any).assigned?.value ??
+                (firstBucket as any).assigned ??
+                null;
+              const completed =
+                (firstBucket as any).completed?.completed_modules?.value ??
+                (firstBucket as any).completed?.completed_count?.value ??
+                null;
+              const chips: string[] = [];
+              if (typeof assigned === 'number') chips.push(`Assigned: ${this.formatNumber(assigned)}`);
+              if (typeof completed === 'number') chips.push(`Completed: ${this.formatNumber(completed)}`);
+              if (chips.length) items = chips;
+            } else {
+              // Generic filters bucket summary
+              const bucketEntries = Object.entries(bucketsObj);
+              items = bucketEntries.map(([k, b]) => `${k} (${(b as any)?.doc_count ?? 0})`);
+              const total = bucketEntries.reduce(
+                (sum: number, [, b]: any) => sum + (typeof (b as any)?.doc_count === 'number' ? (b as any).doc_count : 0),
+                0
+              );
+              value = this.formatNumber(total);
+            }
+          } else {
+            value = this.formatObjectSummary(data);
+          }
         } else if ('buckets' in data && Array.isArray(data.buckets)) {
           // Show actual bucket values - filter out empty/blank keys
           const validBuckets = data.buckets.filter((b: any) => b.key !== undefined && String(b.key).trim() !== '');

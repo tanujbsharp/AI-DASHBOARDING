@@ -4,7 +4,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.http import StreamingHttpResponse
-from .services import OpenSearchClient, BedrockClient, QueryBuilder
+from .services import OpenSearchClient, BedrockClient, QueryBuilder, ReportPlanner
 from .services.conversation_service import get_conversation_service, reload_schemas
 import logging
 import csv
@@ -122,6 +122,22 @@ class BuildPromptView(APIView):
             'prompt': prompt,
             'title': title
         })
+
+
+class ReportPlannerView(APIView):
+    """Guess the best index + starting fields for the report builder."""
+
+    planner = ReportPlanner()
+
+    def post(self, request):
+        data = request.data or {}
+        prompt = data.get('prompt', '')
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            return Response({'error': 'prompt is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        result = self.planner.plan(prompt)
+        return Response(result)
 
 
 class GenerateQueryView(APIView):

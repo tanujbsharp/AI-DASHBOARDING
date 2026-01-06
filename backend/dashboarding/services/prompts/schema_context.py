@@ -54,6 +54,16 @@ class SchemaContextBuilder:
             "Tenant scope is enforced via cmid=1 (ALWAYS include {\"term\": {\"cmid\": 1}} when querying this index). "
             "Time filtering for activity months MUST use completed_on (epoch). Operational freshness questions can use updated_on / last_updated."
         ),
+        'daily_user_activity_summary_prod': (
+            "🔴 DAILY USER ACTIVITY SUMMARY (COUNTS + POINTS) - Each record is ONE USER for ONE DAY. "
+            "This index stores DAILY per-user COUNTS and POINTS only (not event-level module records). "
+            "Use it for day-level totals (today/yesterday/specific date ranges), daily trends, daily leaderboards, and segmentation of: "
+            "module (daily module completion counts), instant_answers, learning_pathway, lotd, points. "
+            "⚠️ DOES NOT support: 'which modules were completed' / module_name breakdown (no module IDs/names). "
+            "Tenant scope is enforced via cmid=1 (ALWAYS include {\"term\": {\"cmid\": 1}} when querying this index). "
+            "Time filtering for activity days MUST use completed_on (epoch). Operational freshness questions can use updated_on / last_updated. "
+            "INDEX STRUCTURE NOTE: Even though the raw mapping stores boolean filters under \"must\", you must convert them to the documented nested bool/filter format before executing the query."
+        ),
         'converse_lm_summary_reports_prod': (
             "🔴 MODULE CATALOG & METADATA INDEX - Use this for ALL 'published' / 'publishing' questions! "
             "This index contains MODULE/COURSE MASTER DATA only: module names, types, product/skill tags, "
@@ -96,8 +106,15 @@ class SchemaContextBuilder:
             # User status field name in MONTHLY ACTIVITY index
             'status': 'User status code: 5=active, 4=deleted, 1=invited - USE THIS FIELD NAME in monthly activity index',
             'cmid': 'Tenant/container scope - ALWAYS filter cmid=1 in this deployment',
-            'id': 'Unique user record ID in this index - USE THIS for counting unique users (cardinality)',
+            'uid': 'Unique user record ID in this index - USE THIS for counting unique users (cardinality)',
             'completed_on': 'Activity month anchor timestamp (epoch) - USE THIS for monthly activity time filters and trends'
+        },
+        'daily_user_activity_summary_prod': {
+            # User status field name in DAILY ACTIVITY index
+            'status': 'User status code: 5=active, 4=deleted, 1=invited - USE THIS FIELD NAME in daily activity index',
+            'cmid': 'Tenant/container scope - ALWAYS filter cmid=1 in this deployment',
+            'uid': 'Unique user record ID in this index - USE THIS for counting unique users (cardinality)',
+            'completed_on': 'Activity day anchor timestamp (epoch) - USE THIS for daily activity time filters, day-level trends, and date_histogram buckets'
         }
     }
     
@@ -169,15 +186,15 @@ class SchemaContextBuilder:
         # META FIELDS
         'created_on': 'Primary assignment/record date (Unix timestamp)',
         'updated_on': 'Timestamp when record was last updated',
-        'id': 'Internal record identifier (NOTE: in monthly_user_activity_summary_prod this is the user record ID; use cardinality(id) for unique users)',
-        'last_updated': 'Last sync/update timestamp (epoch) (MONTHLY ACTIVITY INDEX)',
-        'completed_on': 'Activity month anchor timestamp (epoch) - use for month/time filters and monthly trends (MONTHLY ACTIVITY INDEX)',
-        'module': 'Monthly count of module completions for that month (integer count) - use sum(module) for totals (MONTHLY ACTIVITY INDEX)',
-        'instant_answers': 'Monthly count of Instant Answer queries for that month (MONTHLY ACTIVITY INDEX)',
-        'learning_pathway': 'Monthly count of Learning Pathway completions for that month (MONTHLY ACTIVITY INDEX)',
-        'lotd': 'Monthly count of Learning Of The Day completions for that month (MONTHLY ACTIVITY INDEX)',
-        'points': 'Total points earned in that month (MONTHLY ACTIVITY INDEX)',
-        'total_points_assigned': 'Total points assigned for that month (may be empty/zero if not populated) (MONTHLY ACTIVITY INDEX)',
+        'id': 'Internal record identifier (not used for monthly/daily activity unique-user counts).',
+        'last_updated': 'Last sync/update timestamp (epoch) (activity summary indexes use this for freshness checks)',
+        'completed_on': 'Activity day/month anchor timestamp (epoch) - use for day/month filters and trends in daily_user_activity_summary_prod and monthly_user_activity_summary_prod',
+        'module': 'Monthly/Daily count of module completions in activity summary indexes (integer count) - use sum(module) for totals',
+        'instant_answers': 'Monthly/Daily count of Instant Answer queries in activity summary indexes',
+        'learning_pathway': 'Monthly/Daily count of Learning Pathway completions in activity summary indexes',
+        'lotd': 'Monthly/Daily count of Learning Of The Day completions in activity summary indexes',
+        'points': 'Total points earned during the period (monthly/daily activity indexes)',
+        'total_points': 'Total points earned from the start (cumulative total in activity summary indexes)',
         
         # CUSTOM ATTRIBUTES (tenant-specific)
         'attribute_2': 'Custom attribute 2 (tenant-specific)',
@@ -311,7 +328,7 @@ class SchemaContextBuilder:
             parts.append("  - Consumption index uses: module_status, user_status")
             parts.append("  - Catalog index uses: status (for modules)")
             parts.append("  - User profile index uses: status (for users, different codes!)")
-            parts.append("  - Monthly activity index uses: status (users) + completed_on (monthly time anchor) + id (user id)")
+            parts.append("  - Monthly/Daily activity indexes use: status (users) + completed_on (activity day/month anchor) + uid (user id) and ALWAYS need cmid=1")
             parts.append("  - ALWAYS use the field names that exist in the selected index!")
             parts.append("")
         
@@ -382,7 +399,7 @@ class SchemaContextBuilder:
   
   AGGREGATIONS (CRITICAL - use correct ID fields):
     - Count unique USERS: {"cardinality": {"field": "uid"}}  ← ALWAYS use uid, NOT email_addr
-    - (MONTHLY ACTIVITY INDEX) Count unique USERS: {"cardinality": {"field": "id"}}  ← In monthly_user_activity_summary_prod use id (NOT uid)
+    - (MONTHLY/DAILY ACTIVITY INDEX) Count unique USERS: {"cardinality": {"field": "uid"}}  ← In monthly_user_activity_summary_prod & daily_user_activity_summary_prod use uid (NOT id)
     - Count unique MODULES: {"cardinality": {"field": "mid"}}  ← ALWAYS use mid, NOT module_name
     - Count unique COURSES: {"cardinality": {"field": "cmid"}}  ← Use cmid for courses
     - Count unique MANAGERS: {"cardinality": {"field": "manager_email_addr"}}
@@ -390,8 +407,9 @@ class SchemaContextBuilder:
     - Count unique COACHES: {"cardinality": {"field": "coach_email_addr"}}
     - Group by field: {"terms": {"field": "city", "size": 100}}
     - Filter then count: {"filter": {"term": {...}}, "aggs": {"count": {"cardinality": {...}}}}
-    - (MONTHLY ACTIVITY INDEX) Monthly totals: {"sum": {"field": "module"}} / {"sum": {"field": "instant_answers"}} / {"sum": {"field": "points"}}
+    - (ACTIVITY SUMMARY INDEXES) Totals: {"sum": {"field": "module"}} / {"sum": {"field": "instant_answers"}} / {"sum": {"field": "points"}}  ← works for daily or monthly counts
     - (MONTHLY ACTIVITY INDEX) Monthly trend: {"date_histogram": {"field": "completed_on", "calendar_interval": "month"}} + sum(metric)
+    - (DAILY ACTIVITY INDEX) Daily trend: {"date_histogram": {"field": "completed_on", "fixed_interval": "1d"}} + sum(metric)
     
   GROUPING PATTERN (ID for query, NAME for display):
     When grouping by module/user, use ID field but add sub-agg for name:
@@ -400,7 +418,7 @@ class SchemaContextBuilder:
     
   IMPORTANT ID FIELDS:
     - uid = User ID (integer) - for counting unique users/learners
-    - id = User record ID in monthly activity index - for counting unique users in monthly_user_activity_summary_prod
+    - uid = User record ID in monthly/daily activity indexes - for counting unique users in monthly_user_activity_summary_prod or daily_user_activity_summary_prod
     - mid = Module ID (integer) - for counting unique modules/courses
     - cmid = Course/Module ID - for counting unique courses/containers
     - DO NOT use email_addr or module_name for cardinality counts

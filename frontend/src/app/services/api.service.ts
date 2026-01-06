@@ -87,6 +87,16 @@ export interface QueryRequest {
   sort_order?: 'asc' | 'desc';
 }
 
+export interface ReportPlanResponse {
+  prompt: string;
+  index_id: string;
+  index_name?: string;
+  confidence: number;
+  reasons: string[];
+  recommended_fields: string[];
+  schema: IndexSchema;
+}
+
 @Injectable({
   providedIn: 'root',
 })
@@ -152,6 +162,10 @@ export class ApiService {
       message: this.buildPromptFromRequest(request),
       history: [],
     });
+  }
+
+  planReport(prompt: string): Observable<ReportPlanResponse> {
+    return this.http.post<ReportPlanResponse>(`${this.baseUrl}/report/plan/`, { prompt });
   }
 
   private buildPromptFromRequest(request: QueryRequest): string {

@@ -23,6 +23,7 @@ urlpatterns = [
     path('query/execute/', views.ExecuteQueryView.as_view(), name='execute-query'),
     path('query/export/', views.QueryExportView.as_view(), name='export-query'),
     path('query/build-prompt/', views.BuildPromptView.as_view(), name='build-prompt'),
+    path('report/plan/', views.ReportPlannerView.as_view(), name='report-plan'),
     
     # Utility endpoints
     path('mega-filters/', views.MegaFiltersView.as_view(), name='mega-filters'),

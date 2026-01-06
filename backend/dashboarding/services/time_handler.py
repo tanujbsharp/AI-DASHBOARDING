@@ -112,6 +112,8 @@ class TimeHandler:
         ],
     }
     
+    DEFAULT_TIMEZONE = pytz.timezone("Asia/Kolkata")
+    
     @classmethod
     def parse(cls, message: str) -> TimePeriod:
         """
@@ -135,27 +137,32 @@ class TimeHandler:
         if any(term in message_lower for term in ['all time', 'ever', 'lifetime', 'entire', 'all data', 'total ever']):
             return cls._lifetime()
         
-        # Pattern 1: Year with month (e.g., "November 2024", "2024 November")
+        # Pattern 1: Explicit single-day reference (e.g., "Dec 18 2025")
+        single_day = cls._parse_single_day(message)
+        if single_day:
+            return single_day
+        
+        # Pattern 2: Year with month (e.g., "November 2024", "2024 November")
         year_month = cls._parse_year_month(message_lower)
         if year_month:
             return year_month
         
-        # Pattern 2: Only month mentioned (e.g., "in November", "for December")
+        # Pattern 3: Only month mentioned (e.g., "in November", "for December")
         month_only = cls._parse_month_only(message_lower, now)
         if month_only:
             return month_only
         
-        # Pattern 3: Only year mentioned (e.g., "in 2024", "for 2025")
+        # Pattern 4: Only year mentioned (e.g., "in 2024", "for 2025")
         year_only = cls._parse_year_only(message_lower)
         if year_only:
             return year_only
         
-        # Pattern 4: Relative time (e.g., "last month", "this week", "last 30 days")
+        # Pattern 5: Relative time (e.g., "last month", "this week", "last 30 days")
         relative = cls._parse_relative_time(message_lower, now)
         if relative:
             return relative
         
-        # Pattern 5: No time mentioned → return LIFETIME (all data)
+        # Pattern 6: No time mentioned → return LIFETIME (all data)
         return cls._lifetime()
     
     @classmethod
@@ -290,6 +297,40 @@ class TimeHandler:
                     description=f"{start_dt.strftime('%b %d %Y')} to {end_dt.strftime('%b %d %Y')}",
                     is_lifetime=False
                 )
+        return None
+    
+    @classmethod
+    def _parse_single_day(cls, message: str) -> Optional[TimePeriod]:
+        """Parse explicit single-day references and return a 24-hour TimePeriod."""
+        date_patterns = [
+            r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*)?\s+\d{4}\b',
+            r'\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{4}\b',
+            r'\b\d{4}-\d{1,2}-\d{1,2}\b',
+            r'\b\d{1,2}/\d{1,2}/\d{4}\b'
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, message, flags=re.IGNORECASE)
+            if not match:
+                continue
+            
+            candidate = match.group(0)
+            parsed = cls._parse_explicit_date_string(candidate)
+            if not parsed:
+                continue
+            
+            local_start = cls.DEFAULT_TIMEZONE.localize(datetime(parsed.year, parsed.month, parsed.day, 0, 0, 0))
+            local_end = local_start + timedelta(days=1)
+            
+            start_utc = local_start.astimezone(timezone.utc)
+            end_utc = local_end.astimezone(timezone.utc)
+            
+            return TimePeriod(
+                start_timestamp=int(start_utc.timestamp()),
+                end_timestamp=int(end_utc.timestamp()),
+                description=local_start.strftime("%b %d %Y")
+            )
+        
         return None
     
     @classmethod
@@ -569,28 +610,37 @@ class TimeHandler:
     @classmethod
     def _month_period(cls, month: int, year: int) -> TimePeriod:
         """Create a TimePeriod for a specific month."""
-        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        tz_local = cls.DEFAULT_TIMEZONE
+        local_start = tz_local.localize(datetime(year, month, 1, 0, 0, 0))
         if month == 12:
-            end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            local_end = tz_local.localize(datetime(year + 1, 1, 1, 0, 0, 0))
         else:
-            end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+            local_end = tz_local.localize(datetime(year, month + 1, 1, 0, 0, 0))
+        
+        start = local_start.astimezone(timezone.utc)
+        end = local_end.astimezone(timezone.utc)
+        description = local_start.strftime("%B %Y")
         
         return TimePeriod(
             start_timestamp=int(start.timestamp()),
             end_timestamp=int(end.timestamp()),
-            description=start.strftime("%B %Y")
+            description=description
         )
     
     @classmethod
     def _year_period(cls, year: int) -> TimePeriod:
         """Create a TimePeriod for a full year."""
-        start = datetime(year, 1, 1, tzinfo=timezone.utc)
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        tz_local = cls.DEFAULT_TIMEZONE
+        local_start = tz_local.localize(datetime(year, 1, 1, 0, 0, 0))
+        local_end = tz_local.localize(datetime(year + 1, 1, 1, 0, 0, 0))
+        start = local_start.astimezone(timezone.utc)
+        end = local_end.astimezone(timezone.utc)
+        description = local_start.strftime("year %Y")
         
         return TimePeriod(
             start_timestamp=int(start.timestamp()),
             end_timestamp=int(end.timestamp()),
-            description=f"year {year}"
+            description=description
         )
     
     @classmethod
@@ -647,6 +697,12 @@ class TimeframeResolver:
         'LAST_YEAR'
     }
     
+    FLEX_TIMEFRAMES = {
+        'last_n_months': re.compile(r'\blast\s+(\d+)\s+months?\b'),
+        'last_n_weeks': re.compile(r'\blast\s+(\d+)\s+weeks?\b'),
+        'last_n_days': re.compile(r'\blast\s+(\d+)\s+days?\b')
+    }
+    
     @classmethod
     def extract_timeframe_key(cls, message: str) -> Optional[str]:
         """
@@ -693,6 +749,12 @@ class TimeframeResolver:
                 if re.search(pattern, message_lower):
                     return timeframe_key
         
+        # Flexible detection for "last N months/weeks/days"
+        for key, regex in cls.FLEX_TIMEFRAMES.items():
+            match = regex.search(message_lower)
+            if match:
+                return f"{key}:{match.group(1)}"
+        
         return None
     
     @classmethod
@@ -715,6 +777,11 @@ class TimeframeResolver:
             When date_mode is "date", gte and lt will be OpenSearch date math expressions (strings)
         """
         if timeframe_key not in cls.SUPPORTED_TIMEFRAMES:
+            # Handle dynamic keys like "last_n_months:6"
+            if timeframe_key and ':' in timeframe_key:
+                base_key, value = timeframe_key.split(':', 1)
+                if base_key in cls.FLEX_TIMEFRAMES and value.isdigit():
+                    return cls._resolve_flexible_timeframe(base_key, int(value), timezone_str, date_mode)
             return None
         
         # If date_mode is "date", use OpenSearch date math expressions
@@ -801,22 +868,6 @@ class TimeframeResolver:
                 'lt': 'now',        # Current time
                 'label': 'Last 3 months'
             },
-            'THIS_QUARTER': {
-                # Calculate quarter start based on current month
-                # Q1 (Jan-Mar): month 1, Q2 (Apr-Jun): month 4, Q3 (Jul-Sep): month 7, Q4 (Oct-Dec): month 10
-                # We'll use a calculation: if current month is M, quarter start is floor((M-1)/3)*3 + 1
-                # For simplicity, use approximate: start of current month rounded to quarter
-                # This is approximate but works for most cases
-                'gte': 'now/M||/M',  # Start of current month (will be adjusted by quarter logic if needed)
-                'lt': 'now+3M/M',    # Start of month 3 months from now
-                'label': 'This quarter'
-            },
-            'LAST_QUARTER': {
-                # Previous quarter: 3 months before current quarter start
-                'gte': 'now-3M/M',   # Start of month 3 months ago
-                'lt': 'now/M',       # Start of current month
-                'label': 'Last quarter'
-            },
             'THIS_YEAR': {
                 'gte': 'now/y',      # Start of current year (Jan 1 00:00)
                 'lt': 'now+1y/y',    # Start of next year (Jan 1 00:00)
@@ -830,6 +881,39 @@ class TimeframeResolver:
         }
         
         return date_math_map.get(timeframe_key)
+
+    @classmethod
+    def _resolve_flexible_timeframe(
+        cls,
+        key: str,
+        value: int,
+        timezone_str: str,
+        date_mode: str
+    ) -> Optional[ResolvedTimeframe]:
+        if value <= 0:
+            return None
+        
+        if key == 'last_n_months':
+            gte = f"now-{value}M/M"
+            lt = "now/M" if date_mode == "date" else "now"
+            label = f"Last {value} month{'s' if value != 1 else ''}"
+        elif key == 'last_n_weeks':
+            gte = f"now-{value}w/w"
+            lt = "now/w" if date_mode == "date" else "now"
+            label = f"Last {value} week{'s' if value != 1 else ''}"
+        elif key == 'last_n_days':
+            gte = f"now-{value}d/d"
+            lt = "now/d" if date_mode == "date" else "now"
+            label = f"Last {value} day{'s' if value != 1 else ''}"
+        else:
+            return None
+        
+        return ResolvedTimeframe(
+            gte=gte,
+            lt=lt,
+            label=label,
+            type="RELATIVE"
+        )
     
     @classmethod
     def _resolve_timeframe(
@@ -934,18 +1018,21 @@ class TimeframeResolver:
         elif timeframe_key == 'LAST_QUARTER':
             # Previous quarter start 00:00 → this quarter start 00:00
             current_quarter_start_month = get_quarter_start_month(now.month)
-            if current_quarter_start_month == 1:  # Q1
-                # Previous quarter is Q4 of last year
-                last_quarter_start = start_of_day(datetime(now.year - 1, 10, 1))
-                this_quarter_start = start_of_day(datetime(now.year, 1, 1))
+            current_quarter_start = start_of_day(datetime(now.year, current_quarter_start_month, 1))
+            
+            if current_quarter_start_month == 1:
+                # Last quarter is Q4 of previous year
+                last_quarter_start_month = 10
+                last_quarter_year = now.year - 1
             else:
                 last_quarter_start_month = current_quarter_start_month - 3
-                last_quarter_start = start_of_day(datetime(now.year, last_quarter_start_month, 1))
-                this_quarter_start = start_of_day(datetime(now.year, current_quarter_start_month, 1))
+                last_quarter_year = now.year
+            
+            last_quarter_start = start_of_day(datetime(last_quarter_year, last_quarter_start_month, 1))
             return {
                 'gte': int(last_quarter_start.timestamp()),
-                'lt': int(this_quarter_start.timestamp()),
-                'label': f'Q{(last_quarter_start_month - 1) // 3 + 1} {last_quarter_start.year if last_quarter_start_month == 10 else now.year}'
+                'lt': int(current_quarter_start.timestamp()),
+                'label': f'Q{(last_quarter_start_month - 1) // 3 + 1} {last_quarter_year}'
             }
         
         elif timeframe_key == 'THIS_YEAR':
